@@ -24,7 +24,7 @@ CATEGORY_EMOJIS = {
 # Эмодзи для уровней
 LEVEL_EMOJIS = {
     'Junior': '🟢',
-    'Middle': '🟡',
+    'Middle': '🔵',
     'Senior': '🔴',
     'Not specified': '⚪',
 }
@@ -391,6 +391,155 @@ class JobMessageFormatter:
         
         return '\n'.join(lines)
     
+    def format_enhanced_job_card(self, job: Dict) -> str:
+        """Улучшенный формат карточки вакансии"""
+        title = job.get('title', 'Вакансия')
+        company = job.get('company', 'Не указана')
+        level = job.get('level', 'Junior')
+        category = job.get('category', 'other')
+        salary = job.get('salary', 'Не указана')
+        location = job.get('location', 'Remote')
+        description = job.get('description', '')
+        posted_time = job.get('published', '') or job.get('created', '') or job.get('posted_at', '')
+        
+        cat_emoji = self._get_category_emoji(category)
+        level_emoji = LEVEL_EMOJIS.get(level, '⚪')
+        
+        # Format salary
+        if salary and salary not in ['Не указана', 'Not specified', '']:
+            salary_text = f'💰 *{self._escape_markdown_v2(salary)}*'
+        else:
+            salary_text = '💰 _Договорная_'
+        
+        # Format location emoji
+        loc_lower = location.lower()
+        if any(kw in loc_lower for kw in ['remote', 'удален', 'worldwide']):
+            loc_emoji = '🌍'
+        elif any(kw in loc_lower for kw in ['usa', 'us ', 'united states']):
+            loc_emoji = '🇺🇸'
+        elif any(kw in loc_lower for kw in ['uk', 'united kingdom', 'london']):
+            loc_emoji = '🇬🇧'
+        elif any(kw in loc_lower for kw in ['eu', 'europe']):
+            loc_emoji = '🇪🇺'
+        elif any(kw in loc_lower for kw in ['ru', 'russia', 'россия']):
+            loc_emoji = '🇷🇺'
+        else:
+            loc_emoji = '📍'
+        
+        # Format posted time
+        if posted_time:
+            try:
+                from datetime import datetime
+                dt = datetime.fromisoformat(str(posted_time).replace('Z', '+00:00'))
+                posted_str = dt.strftime('%d %b')
+            except:
+                posted_str = 'Недавно'
+        else:
+            posted_str = 'Недавно'
+        
+        # Short description
+        if description:
+            desc_short = description[:200] + ('...' if len(description) > 200 else '')
+        else:
+            desc_short = 'Описание не указано'
+        
+        # Tags inline
+        tags = job.get('tags', [])
+        if tags:
+            tag_texts = []
+            for tag in tags[:4]:
+                if isinstance(tag, str):
+                    tag_texts.append(f'`{self._escape_markdown_v2(tag)}`')
+            tags_inline = ' '.join(tag_texts) if tag_texts else '_Не указаны_'
+        else:
+            tags_inline = '_Не указаны_'
+        
+        lines = [
+            f"🏢 *{self._escape_markdown_v2(company)}*",
+            f"⭐ {level_emoji} | {loc_emoji} {self._escape_markdown_v2(location)}",
+            "",
+            "─────────────────────",
+            "",
+            f"💼 *{self._escape_markdown_v2(title)}*",
+            f"",
+            f"🏷️ {tags_inline}",
+            f"",
+            f"{salary_text}",
+            f"📅 Опубликовано: {self._escape_markdown_v2(posted_str)}",
+            "",
+            "─────────────────────",
+            "",
+            f"📝 *Описание:*",
+            f"{self._escape_markdown_v2(desc_short)}",
+        ]
+        
+        return '\n'.join(lines)
+
+    def create_enhanced_job_keyboard(self, job: Dict, job_hash: str) -> Dict:
+        """Создание улучшенной inline-клавиатуры для карточки вакансии"""
+        url = job.get('url', '')
+        
+        keyboard = [
+            [
+                {'text': '❤️ В избранное', 'callback_data': f'fav:{job_hash}'},
+                {'text': '🔗 Открыть', 'url': url} if url else {'text': '🔗 Нет ссылки', 'callback_data': 'noop'}
+            ],
+            [
+                {'text': '👤 Похожие', 'callback_data': f'similar:{job_hash}'},
+                {'text': '🗑 Скрыть', 'callback_data': f'hide:{job_hash}'}
+            ],
+            [
+                {'text': '📤 Поделиться', 'switch_inline_query': f"job:{job_hash}"}
+            ]
+        ]
+        
+        return {'inline_keyboard': keyboard}
+
+    def format_job_enhanced(self, job: Dict) -> FormattedMessage:
+        """Улучшенное форматирование вакансии с новой карточкой"""
+        text = self.format_enhanced_job_card(job)
+        job_hash = job.get('hash') or job.get('content_hash') or 'unknown'
+        keyboard = self.create_enhanced_job_keyboard(job, job_hash)
+        
+        return FormattedMessage(
+            text=text,
+            parse_mode=self.parse_mode,
+            reply_markup=keyboard,
+            disable_web_page_preview=True
+        )
+
+    def format_smart_alert(self, jobs: List[Dict], category_name: str = None) -> str:
+        """Форматирование умного уведомления о нескольких вакансиях"""
+        count = len(jobs)
+        
+        lines = [
+            f"🔥 *{count} новых вакансий по твоему профилю!*",
+            ""
+        ]
+        
+        if category_name:
+            lines.append(f"📊 *{self._escape_markdown_v2(category_name)}* — {count} шт.")
+        
+        lines.append("")
+        
+        for job in jobs[:3]:
+            title = job.get('title', 'Вакансия')
+            company = job.get('company', 'Не указана')
+            level = job.get('level', 'Junior')
+            category = job.get('category', 'other')
+            
+            cat_emoji = self._get_category_emoji(category)
+            level_emoji = LEVEL_EMOJIS.get(level, '⚪')
+            
+            lines.append(f"• {cat_emoji} *{self._escape_markdown_v2(title)}* @ {self._escape_markdown_v2(company)} {level_emoji}")
+        
+        if count > 3:
+            lines.append(f"\n_...и ещё {count - 3} вакансий_")
+        
+        lines.append("\n👇 *Подробности в канале*")
+        
+        return '\n'.join(lines)
+    
     def create_category_settings_keyboard(self, enabled_categories: List[str]) -> Dict:
         """
         Создание клавиатуры для настройки категорий.
@@ -446,6 +595,16 @@ def format_job_message(job: Dict, view_mode: str = 'compact') -> FormattedMessag
 def format_job_list_message(jobs: List[Dict], limit: int = 10) -> str:
     """Удобная функция для форматирования списка"""
     return get_formatter().format_job_list(jobs, limit)
+
+
+def format_job_message_enhanced(job: Dict) -> FormattedMessage:
+    """Удобная функция для форматирования вакансии (улучшенный формат)"""
+    return get_formatter().format_job_enhanced(job)
+
+
+def format_smart_alert_message(jobs: List[Dict], category_name: str = None) -> str:
+    """Удобная функция для форматирования умного уведомления"""
+    return get_formatter().format_smart_alert(jobs, category_name)
 
 
 if __name__ == '__main__':

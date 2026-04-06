@@ -26,8 +26,21 @@ import aiohttp
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
     Application, CommandHandler, ContextTypes,
-    CallbackQueryHandler, filters
+    CallbackQueryHandler, filters, ConversationHandler
 )
+
+# Import onboarding module
+try:
+    from onboarding import (
+        get_onboarding_manager, OnboardingStep,
+        LEVEL_OPTIONS, CATEGORY_OPTIONS, WORK_FORMAT_OPTIONS,
+        TECHNOLOGY_OPTIONS, FREQUENCY_OPTIONS,
+        format_user_preferences
+    )
+    ONBOARDING_AVAILABLE = True
+except ImportError:
+    ONBOARDING_AVAILABLE = False
+    logging.warning("⚠️ onboarding module not found, onboarding flow disabled")
 from telegram.error import RetryAfter, TimedOut
 from telegram.constants import ParseMode
 from dotenv import load_dotenv
@@ -305,6 +318,11 @@ class DatabaseConnection:
                         enabled_categories TEXT DEFAULT 'development,qa,devops,data,marketing,sales,pm,design,other',
                         hide_senior BOOLEAN DEFAULT 1,
                         min_salary_filter INTEGER DEFAULT 0,
+                        level_preference TEXT DEFAULT 'both',
+                        work_format TEXT DEFAULT 'remote',
+                        technologies TEXT DEFAULT '',
+                        notification_frequency TEXT DEFAULT 'instant',
+                        onboarding_completed BOOLEAN DEFAULT 0,
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
                 """)
@@ -329,6 +347,20 @@ class DatabaseConnection:
                     await db.execute("SELECT category FROM posted_jobs LIMIT 1")
                 except aiosqlite.OperationalError:
                     await db.execute("ALTER TABLE posted_jobs ADD COLUMN category TEXT DEFAULT 'other'")
+
+                # Migrations for user_settings new fields
+                for column, col_type in [
+                    ('level_preference', 'TEXT DEFAULT \'both\''),
+                    ('work_format', 'TEXT DEFAULT \'remote\''),
+                    ('technologies', 'TEXT DEFAULT \'\''),
+                    ('notification_frequency', 'TEXT DEFAULT \'instant\''),
+                    ('onboarding_completed', 'BOOLEAN DEFAULT 0'),
+                ]:
+                    try:
+                        await db.execute(f"SELECT {column} FROM user_settings LIMIT 1")
+                    except aiosqlite.OperationalError:
+                        await db.execute(f"ALTER TABLE user_settings ADD COLUMN {column} {col_type}")
+                        logger.info(f"✅ Added column {column} to user_settings")
 
                 await db.commit()
 
@@ -411,15 +443,20 @@ class DatabaseConnection:
     async def get_user_settings(self, user_id: int) -> Dict:
         """Get user settings"""
         result = await self.fetchone(
-            'SELECT enabled_categories, hide_senior, min_salary_filter FROM user_settings WHERE user_id = ?',
+            'SELECT enabled_categories, hide_senior, min_salary_filter, level_preference, work_format, technologies, notification_frequency, onboarding_completed FROM user_settings WHERE user_id = ?',
             (user_id,)
         )
 
         if result:
             return {
-                'enabled_categories': result[0].split(','),
+                'enabled_categories': result[0].split(',') if result[0] else list(CATEGORY_NAMES_RU.keys()),
                 'hide_senior': bool(result[1]),
                 'min_salary_filter': result[2],
+                'level_preference': result[3] or 'both',
+                'work_format': result[4] or 'remote',
+                'technologies': result[5].split(',') if result[5] else [],
+                'notification_frequency': result[6] or 'instant',
+                'onboarding_completed': bool(result[7]),
             }
 
         # Default settings
@@ -427,6 +464,76 @@ class DatabaseConnection:
             'enabled_categories': list(CATEGORY_NAMES_RU.keys()),
             'hide_senior': True,
             'min_salary_filter': 0,
+            'level_preference': 'both',
+            'work_format': 'remote',
+            'technologies': [],
+            'notification_frequency': 'instant',
+            'onboarding_completed': False,
+        }
+
+    async def save_user_onboarding(self, user_id: int, level: str, categories: List[str], 
+                                   work_format: str, technologies: List[str], 
+                                   frequency: str) -> bool:
+        """Save user onboarding preferences"""
+        try:
+            await self.execute("""
+                INSERT OR REPLACE INTO user_settings 
+                (user_id, enabled_categories, level_preference, work_format, technologies, 
+                 notification_frequency, onboarding_completed, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP)
+            """, (
+                user_id,
+                ','.join(categories),
+                level,
+                work_format,
+                ','.join(technologies),
+                frequency
+            ))
+            return True
+        except Exception as e:
+            logger.error(f"Error saving onboarding: {e}")
+            return False
+
+    async def update_notification_frequency(self, user_id: int, frequency: str) -> bool:
+        """Update user notification frequency"""
+        try:
+            await self.execute("""
+                INSERT OR REPLACE INTO user_settings 
+                (user_id, notification_frequency, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(user_id) DO UPDATE SET
+                notification_frequency = excluded.notification_frequency,
+                updated_at = CURRENT_TIMESTAMP
+            """, (user_id, frequency))
+            return True
+        except Exception as e:
+            logger.error(f"Error updating frequency: {e}")
+            return False
+
+    async def get_today_stats(self) -> Dict:
+        """Get today's job posting statistics"""
+        from datetime import datetime, timedelta
+        today = datetime.now().strftime('%Y-%m-%d')
+        hour_ago = (datetime.now() - timedelta(hours=1)).strftime('%Y-%m-%d %H:%M:%S')
+        
+        # Total today
+        result = await self.fetchone(
+            "SELECT COUNT(*) FROM posted_jobs WHERE date(posted_at) = ?",
+            (today,)
+        )
+        total_today = result[0] if result else 0
+        
+        # Hot jobs (posted within last hour)
+        result = await self.fetchone(
+            "SELECT COUNT(*) FROM posted_jobs WHERE posted_at >= ?",
+            (hour_ago,)
+        )
+        hot_count = result[0] if result else 0
+        
+        return {
+            'total_today': total_today,
+            'hot_count': hot_count,
+            'new_hour_count': hot_count
         }
 
     async def update_user_categories(self, user_id: int, categories: List[str]) -> bool:
@@ -1113,21 +1220,88 @@ class JobBot:
         return True
 
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /start command"""
+        """Handle /start command - Enhanced with stats and onboarding check"""
+        user_id = update.effective_user.id
+        first_name = update.effective_user.first_name
+        
+        # Get user settings to check if onboarding is completed
+        settings = await self.db.get_user_settings(user_id)
+        
+        # If onboarding not completed and onboarding module available, start it
+        if not settings.get('onboarding_completed', False) and ONBOARDING_AVAILABLE:
+            await self._start_onboarding(update, context)
+            return
+        
+        # Get today's stats
+        stats = await self.db.get_today_stats()
+        
+        # Format user preferences for display
+        level_text = LEVEL_OPTIONS.get(settings.get('level_preference', 'both'), {}).get('text', '✅ Оба уровня')
+        work_text = WORK_FORMAT_OPTIONS.get(settings.get('work_format', 'remote'), {}).get('text', '🏠 Удалённо')
+        
+        # Format categories
+        categories = settings.get('enabled_categories', [])
+        if categories and len(categories) < len(CATEGORY_NAMES_RU):
+            cat_emojis = [CATEGORY_EMOJIS.get(c, '📌') for c in categories[:5]]
+            cat_text = ' '.join(cat_emojis)
+        else:
+            cat_text = '💻 Все категории'
+        
         welcome_text = (
-            "👋 Привет! Я бот для сбора IT-вакансий Junior/Middle уровня.\n\n"
-            "*Доступные команды:*\n"
-            "/status - Статистика бота\n"
-            "/last N - Последние N вакансий\n"
-            "/favorites - Мои сохраненные вакансии\n"
-            "/categories - Настройка категорий\n"
-            "/pause - Приостановить публикацию (admin)\n"
-            "/resume - Возобновить публикацию (admin)"
+            f"👋 *Привет, {first_name}!*\n\n"
+            f"🚀 *Найди свою идеальную remote-работу в IT*\n\n"
+            f"📊 *Сегодня добавлено:*\n"
+            f"• Всего вакансий: `{stats['total_today']}`\n"
+            f"• 🔥 Горячих: `{stats['hot_count']}`\n"
+            f"• ⚡️ Новых за час: `{stats['new_hour_count']}`\n\n"
+            f"💡 *Твои настройки:*\n"
+            f"• Уровень: {level_text}\n"
+            f"• Категории: {cat_text}\n"
+            f"• Формат: {work_text}"
         )
+        
+        start_keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("⚙️ Настроить предпочтения", callback_data="settings")],
+            [InlineKeyboardButton("🔥 Горячие вакансии", callback_data="hot_jobs"),
+             InlineKeyboardButton("⚡️ Новые за час", callback_data="recent_jobs")],
+            [InlineKeyboardButton("📊 Зарплатная статистика", callback_data="salary_stats"),
+             InlineKeyboardButton("❤️ Избранное", callback_data="favorites")],
+        ])
 
         await update.message.reply_text(
             welcome_text,
-            parse_mode=ParseMode.MARKDOWN
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=start_keyboard
+        )
+
+    async def _start_onboarding(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Start onboarding wizard"""
+        if not ONBOARDING_AVAILABLE:
+            return
+            
+        manager = get_onboarding_manager()
+        state = manager.reset(update.effective_user.id)
+        
+        # Step 1: Level selection
+        progress = manager.get_progress_text(update.effective_user.id)
+        
+        level_keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🟢 Junior (0-2 года)", callback_data="onboard_level_junior")],
+            [InlineKeyboardButton("🔵 Middle (2-5 лет)", callback_data="onboard_level_middle")],
+            [InlineKeyboardButton("✅ Оба уровня", callback_data="onboard_level_both")],
+        ])
+        
+        message = (
+            f"👋 Привет! Давай настроим твой профиль\n\n"
+            f"{progress}\n"
+            f"*Уровень опыта*\n\n"
+            f"Какой уровень вакансий тебе интересен?"
+        )
+        
+        await update.message.reply_text(
+            message,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=level_keyboard
         )
 
     async def cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1272,15 +1446,272 @@ class JobBot:
         await update.message.reply_text("▶️ Публикация возобновлена")
         logger.info("▶️ Bot resumed by admin")
 
+    async def cmd_frequency(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /frequency command - Notification frequency settings"""
+        user_id = update.effective_user.id
+        settings = await self.db.get_user_settings(user_id)
+        current_freq = settings.get('notification_frequency', 'instant')
+        
+        keyboard_rows = []
+        for freq_id, freq_data in FREQUENCY_OPTIONS.items():
+            emoji = "✅" if freq_id == current_freq else ""
+            keyboard_rows.append([InlineKeyboardButton(
+                f"{emoji} {freq_data['text']}",
+                callback_data=f"freq:{freq_id}"
+            )])
+        
+        keyboard = InlineKeyboardMarkup(keyboard_rows)
+        
+        await update.message.reply_text(
+            "🔔 *Настройка частоты уведомлений*\n\n"
+            "Выбери, как часто получать новые вакансии:",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=keyboard
+        )
+
+    async def cmd_search(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /search command - Search jobs by query"""
+        query = ' '.join(context.args) if context.args else None
+        
+        if not query:
+            await update.message.reply_text(
+                "🔍 *Поиск по вакансиям*\n\n"
+                "Использование: `/search <запрос>`\n\n"
+                "*Примеры:*\n"
+                "• `/search python junior`\n"
+                "• `/search react remote`\n"
+                "• `/search golang middle`\n"
+                "• `/search frontend`",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        # Search in recent jobs (last 30 days)
+        month_ago = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
+        
+        results = await self.db.fetchall("""
+            SELECT hash, title, company, level, category, url, posted_at 
+            FROM posted_jobs 
+            WHERE (title LIKE ? OR company LIKE ? OR description LIKE ?)
+            AND posted_at >= ?
+            ORDER BY posted_at DESC 
+            LIMIT 20
+        """, (f'%{query}%', f'%{query}%', f'%{query}%', month_ago))
+        
+        if not results:
+            await update.message.reply_text(
+                f"🔍 По запросу `'{query}'` ничего не найдено.\n\n"
+                f"Попробуй другие ключевые слова или проверь позже!",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        # Format results
+        jobs = []
+        for row in results:
+            jobs.append({
+                'hash': row[0],
+                'title': row[1],
+                'company': row[2],
+                'level': row[3],
+                'category': row[4],
+                'url': row[5],
+                'posted_at': row[6]
+            })
+        
+        # Store in context for pagination
+        context.user_data['search_results'] = jobs
+        context.user_data['search_query'] = query
+        context.user_data['search_page'] = 0
+        
+        await self._send_search_results(update, context, jobs[:5], query, 0, len(jobs))
+
+    async def _send_search_results(self, update: Update, context: ContextTypes.DEFAULT_TYPE, 
+                                   jobs: List[Dict], query: str, page: int, total: int):
+        """Send search results with pagination"""
+        total_pages = (total - 1) // 5 + 1
+        current_page = page + 1
+        
+        lines = [
+            f"🔍 *Результаты поиска: '{query}'*",
+            f"📄 Страница {current_page} из {total_pages} ({total} найдено)\n"
+        ]
+        
+        for job in jobs:
+            cat_emoji = CATEGORY_EMOJIS.get(job['category'], '📌')
+            level_emoji = LEVEL_EMOJIS.get(job.get('level', ''), '⚪')
+            
+            lines.append(
+                f"{cat_emoji} *{self._escape_markdown_v2(job['title'])}*\n"
+                f"🏢 _{self._escape_markdown_v2(job['company'])}_ | {level_emoji}\n"
+                f"[🔗 Открыть]({self._escape_markdown_v2(job['url'])})\n"
+            )
+        
+        # Build pagination keyboard
+        keyboard_buttons = []
+        nav_row = []
+        
+        if page > 0:
+            nav_row.append(InlineKeyboardButton("◀️ Назад", callback_data=f"search_page:{page-1}"))
+        if current_page < total_pages:
+            nav_row.append(InlineKeyboardButton("Вперёд ▶️", callback_data=f"search_page:{page+1}"))
+        
+        if nav_row:
+            keyboard_buttons.append(nav_row)
+        
+        keyboard = InlineKeyboardMarkup(keyboard_buttons) if keyboard_buttons else None
+        
+        message_text = '\n'.join(lines)
+        
+        if update.callback_query:
+            await update.callback_query.edit_message_text(
+                message_text,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=keyboard,
+                disable_web_page_preview=True
+            )
+        else:
+            await update.message.reply_text(
+                message_text,
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=keyboard,
+                disable_web_page_preview=True
+            )
+
+    def _escape_markdown_v2(self, text: str) -> str:
+        """Escape special characters for MarkdownV2"""
+        if not text:
+            return ''
+        escape_chars = r'_*[]()~`>#+-=|{}.!'
+        for char in escape_chars:
+            text = text.replace(char, f'\\{char}')
+        return text
+
     async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle inline keyboard callbacks"""
+        """Handle inline keyboard callbacks - Enhanced with onboarding and search"""
         query = update.callback_query
         await query.answer()
 
         data = query.data
         user_id = update.effective_user.id
 
-        if data.startswith('save:'):
+        # Onboarding callbacks
+        if data.startswith('onboard_level_'):
+            if ONBOARDING_AVAILABLE:
+                level = data.replace('onboard_level_', '')
+                manager = get_onboarding_manager()
+                manager.update_state(user_id, level_preference=level)
+                manager.next_step(user_id)
+                await self._show_onboarding_categories(update, context)
+            return
+
+        elif data.startswith('onboard_cat_'):
+            if ONBOARDING_AVAILABLE:
+                category = data.replace('onboard_cat_', '')
+                manager = get_onboarding_manager()
+                manager.toggle_category(user_id, category)
+                await self._show_onboarding_categories(update, context)
+            return
+
+        elif data == 'onboard_categories_next':
+            if ONBOARDING_AVAILABLE:
+                manager = get_onboarding_manager()
+                manager.next_step(user_id)
+                await self._show_onboarding_work_format(update, context)
+            return
+
+        elif data.startswith('onboard_work_'):
+            if ONBOARDING_AVAILABLE:
+                work_format = data.replace('onboard_work_', '')
+                manager = get_onboarding_manager()
+                manager.update_state(user_id, work_format=work_format)
+                manager.next_step(user_id)
+                await self._show_onboarding_technologies(update, context)
+            return
+
+        elif data.startswith('onboard_tech_'):
+            if ONBOARDING_AVAILABLE:
+                tech = data.replace('onboard_tech_', '')
+                manager = get_onboarding_manager()
+                manager.toggle_technology(user_id, tech)
+                await self._show_onboarding_technologies(update, context)
+            return
+
+        elif data == 'onboard_technologies_next':
+            if ONBOARDING_AVAILABLE:
+                manager = get_onboarding_manager()
+                manager.next_step(user_id)
+                await self._show_onboarding_frequency(update, context)
+            return
+
+        elif data.startswith('onboard_freq_'):
+            if ONBOARDING_AVAILABLE:
+                frequency = data.replace('onboard_freq_', '')
+                manager = get_onboarding_manager()
+                manager.update_state(user_id, frequency=frequency)
+                manager.complete_onboarding(user_id)
+                
+                # Save to database
+                state = manager.get_state(user_id)
+                await self.db.save_user_onboarding(
+                    user_id, state.level_preference, state.categories,
+                    state.work_format, state.technologies, state.frequency
+                )
+                
+                # Show completion message
+                await self._show_onboarding_complete(update, context, state)
+            return
+
+        elif data == 'settings':
+            # Restart onboarding
+            if ONBOARDING_AVAILABLE:
+                await self._start_onboarding(update, context)
+            return
+
+        elif data == 'hot_jobs':
+            await self._show_hot_jobs(update, context)
+            return
+
+        elif data == 'recent_jobs':
+            await self._show_recent_jobs(update, context)
+            return
+
+        elif data == 'salary_stats':
+            await query.answer("В разработке!")
+            return
+
+        elif data == 'favorites':
+            await self.cmd_favorites(update, context)
+            return
+
+        # Frequency settings
+        elif data.startswith('freq:'):
+            frequency = data.replace('freq:', '')
+            await self.db.update_notification_frequency(user_id, frequency)
+            freq_text = FREQUENCY_OPTIONS.get(frequency, {}).get('text', frequency)
+            await query.edit_message_text(
+                f"🔔 *Настройка частоты уведомлений*\n\n"
+                f"✅ Выбрано: {freq_text}\n\n"
+                f"Настройки сохранены!",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+
+        # Search pagination
+        elif data.startswith('search_page:'):
+            page = int(data.replace('search_page:', ''))
+            jobs = context.user_data.get('search_results', [])
+            query_text = context.user_data.get('search_query', '')
+            
+            if jobs:
+                start = page * 5
+                end = start + 5
+                page_jobs = jobs[start:end]
+                await self._send_search_results(update, context, page_jobs, query_text, page, len(jobs))
+            return
+
+        # Existing callbacks
+        elif data.startswith('save:'):
             job_hash = data.split(':', 1)[1]
             await self.db.add_favorite(user_id, job_hash)
             await query.edit_message_text(
@@ -1290,7 +1721,6 @@ class JobBot:
             )
 
         elif data.startswith('expand:'):
-            # Получаем полную информацию о вакансии и показываем развернутый вид
             await query.answer("Разворачиваю... (в разработке)")
 
         elif data.startswith('compact:'):
@@ -1319,7 +1749,6 @@ class JobBot:
 
             await self.db.update_user_categories(user_id, enabled)
 
-            # Обновляем клавиатуру
             if self.formatter:
                 keyboard = self.formatter.create_category_settings_keyboard(enabled)
                 await query.edit_message_reply_markup(
@@ -1328,6 +1757,257 @@ class JobBot:
 
         elif data == 'close_settings':
             await query.delete_message()
+
+    # Onboarding helper methods
+    async def _show_onboarding_categories(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show category selection step"""
+        if not ONBOARDING_AVAILABLE:
+            return
+            
+        manager = get_onboarding_manager()
+        user_id = update.effective_user.id
+        state = manager.get_state(user_id)
+        progress = manager.get_progress_text(user_id)
+        
+        # Build category keyboard with checkmarks
+        keyboard_rows = []
+        row = []
+        for cat_id, cat_data in CATEGORY_OPTIONS.items():
+            is_selected = cat_id in state.categories
+            emoji = "✅" if is_selected else "⬜️"
+            row.append(InlineKeyboardButton(
+                f"{emoji} {cat_data['text']}",
+                callback_data=f"onboard_cat_{cat_id}"
+            ))
+            if len(row) == 2:
+                keyboard_rows.append(row)
+                row = []
+        if row:
+            keyboard_rows.append(row)
+        
+        # Add next button
+        keyboard_rows.append([InlineKeyboardButton("Далее ➡️", callback_data="onboard_categories_next")])
+        
+        keyboard = InlineKeyboardMarkup(keyboard_rows)
+        
+        message = (
+            f"👋 Давай настроим твой профиль\n\n"
+            f"{progress}\n"
+            f"*Категории вакансий*\n\n"
+            f"Выбери интересующие категории (можно несколько):"
+        )
+        
+        if update.callback_query:
+            await update.callback_query.edit_message_text(
+                message, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard
+            )
+        else:
+            await update.message.reply_text(
+                message, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard
+            )
+
+    async def _show_onboarding_work_format(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show work format selection step"""
+        if not ONBOARDING_AVAILABLE:
+            return
+            
+        manager = get_onboarding_manager()
+        user_id = update.effective_user.id
+        progress = manager.get_progress_text(user_id)
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🏠 Удалённо", callback_data="onboard_work_remote")],
+            [InlineKeyboardButton("🔄 Гибрид", callback_data="onboard_work_hybrid")],
+            [InlineKeyboardButton("🏢 В офисе", callback_data="onboard_work_office")],
+        ])
+        
+        message = (
+            f"👋 Давай настроим твой профиль\n\n"
+            f"{progress}\n"
+            f"*Формат работы*\n\n"
+            f"Какой формат работы тебе интересен?"
+        )
+        
+        await update.callback_query.edit_message_text(
+            message, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard
+        )
+
+    async def _show_onboarding_technologies(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show technology selection step"""
+        if not ONBOARDING_AVAILABLE:
+            return
+            
+        manager = get_onboarding_manager()
+        user_id = update.effective_user.id
+        state = manager.get_state(user_id)
+        progress = manager.get_progress_text(user_id)
+        
+        # Build tech keyboard
+        keyboard_rows = []
+        row = []
+        for tech_id, tech_data in TECHNOLOGY_OPTIONS.items():
+            is_selected = tech_id in state.technologies
+            emoji = "✅" if is_selected else "⬜️"
+            row.append(InlineKeyboardButton(
+                f"{emoji} {tech_data['text']}",
+                callback_data=f"onboard_tech_{tech_id}"
+            ))
+            if len(row) == 2:
+                keyboard_rows.append(row)
+                row = []
+        if row:
+            keyboard_rows.append(row)
+        
+        # Add next button
+        keyboard_rows.append([InlineKeyboardButton("Далее ➡️", callback_data="onboard_technologies_next")])
+        
+        keyboard = InlineKeyboardMarkup(keyboard_rows)
+        
+        message = (
+            f"👋 Давай настроим твой профиль\n\n"
+            f"{progress}\n"
+            f"*Технологии*\n\n"
+            f"Выбери технологии (можно несколько или пропустить):"
+        )
+        
+        await update.callback_query.edit_message_text(
+            message, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard
+        )
+
+    async def _show_onboarding_frequency(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show frequency selection step"""
+        if not ONBOARDING_AVAILABLE:
+            return
+            
+        manager = get_onboarding_manager()
+        user_id = update.effective_user.id
+        progress = manager.get_progress_text(user_id)
+        
+        keyboard_rows = []
+        for freq_id, freq_data in FREQUENCY_OPTIONS.items():
+            keyboard_rows.append([InlineKeyboardButton(
+                freq_data['text'],
+                callback_data=f"onboard_freq_{freq_id}"
+            )])
+        
+        keyboard = InlineKeyboardMarkup(keyboard_rows)
+        
+        message = (
+            f"👋 Давай настроим твой профиль\n\n"
+            f"{progress}\n"
+            f"*Частота уведомлений*\n\n"
+            f"Как часто присылать новые вакансии?"
+        )
+        
+        await update.callback_query.edit_message_text(
+            message, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard
+        )
+
+    async def _show_onboarding_complete(self, update: Update, context: ContextTypes.DEFAULT_TYPE, state):
+        """Show onboarding completion message"""
+        preferences_text = format_user_preferences(state)
+        
+        start_keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔥 Горячие вакансии", callback_data="hot_jobs"),
+             InlineKeyboardButton("⚡️ Новые за час", callback_data="recent_jobs")],
+            [InlineKeyboardButton("⚙️ Изменить настройки", callback_data="settings")],
+        ])
+        
+        message = (
+            f"🎉 *Профиль настроен!*\n\n"
+            f"{preferences_text}\n\n"
+            f"Теперь я буду подбирать вакансии под твои предпочтения!"
+        )
+        
+        await update.callback_query.edit_message_text(
+            message, parse_mode=ParseMode.MARKDOWN, reply_markup=start_keyboard
+        )
+
+    async def _show_hot_jobs(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show hot jobs (recent)"""
+        from datetime import datetime, timedelta
+        hour_ago = (datetime.now() - timedelta(hours=24)).strftime('%Y-%m-%d %H:%M:%S')
+        
+        results = await self.db.fetchall(
+            'SELECT title, company, level, category, url FROM posted_jobs '
+            'WHERE posted_at >= ? ORDER BY posted_at DESC LIMIT 10',
+            (hour_ago,)
+        )
+        
+        if not results:
+            await update.callback_query.edit_message_text(
+                "🔥 *Горячие вакансии*\n\n"
+                "Пока нет новых вакансий за последние 24 часа.\n"
+                "Загляни позже!",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        lines = ["🔥 *Горячие вакансии (24ч):*\n"]
+        for row in results[:5]:
+            title, company, level, category, url = row
+            cat_emoji = CATEGORY_EMOJIS.get(category, '📌')
+            level_emoji = LEVEL_EMOJIS.get(level, '⚪')
+            lines.append(
+                f"{cat_emoji} *{self._escape_markdown_v2(title)}*\n"
+                f"🏢 _{self._escape_markdown_v2(company)}_ | {level_emoji}\n"
+                f"[🔗 Открыть]({self._escape_markdown_v2(url)})\n"
+            )
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("⚡️ Новые за час", callback_data="recent_jobs"),
+             InlineKeyboardButton("🔍 Поиск", callback_data="search")],
+        ])
+        
+        await update.callback_query.edit_message_text(
+            '\n'.join(lines),
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=keyboard,
+            disable_web_page_preview=True
+        )
+
+    async def _show_recent_jobs(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show recent jobs (last hour)"""
+        from datetime import datetime, timedelta
+        hour_ago = (datetime.now() - timedelta(hours=1)).strftime('%Y-%m-%d %H:%M:%S')
+        
+        results = await self.db.fetchall(
+            'SELECT title, company, level, category, url FROM posted_jobs '
+            'WHERE posted_at >= ? ORDER BY posted_at DESC LIMIT 10',
+            (hour_ago,)
+        )
+        
+        if not results:
+            await update.callback_query.edit_message_text(
+                "⚡️ *Новые за час*\n\n"
+                "Пока нет новых вакансий за последний час.\n"
+                "Загляни позже!",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        lines = [f"⚡️ *Новые вакансии ({len(results)} за час):*\n"]
+        for row in results[:5]:
+            title, company, level, category, url = row
+            cat_emoji = CATEGORY_EMOJIS.get(category, '📌')
+            level_emoji = LEVEL_EMOJIS.get(level, '⚪')
+            lines.append(
+                f"{cat_emoji} *{self._escape_markdown_v2(title)}*\n"
+                f"🏢 _{self._escape_markdown_v2(company)}_ | {level_emoji}\n"
+                f"[🔗 Открыть]({self._escape_markdown_v2(url)})\n"
+            )
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔥 Горячие вакансии", callback_data="hot_jobs"),
+             InlineKeyboardButton("🔍 Поиск", callback_data="search")],
+        ])
+        
+        await update.callback_query.edit_message_text(
+            '\n'.join(lines),
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=keyboard,
+            disable_web_page_preview=True
+        )
 
     async def post_job(self, job: Dict) -> bool:
         """Post job to channel with enhanced formatting"""
@@ -1401,6 +2081,8 @@ async def main():
     application.add_handler(CommandHandler("categories", job_bot.cmd_categories))
     application.add_handler(CommandHandler("pause", job_bot.cmd_pause))
     application.add_handler(CommandHandler("resume", job_bot.cmd_resume))
+    application.add_handler(CommandHandler("frequency", job_bot.cmd_frequency))
+    application.add_handler(CommandHandler("search", job_bot.cmd_search))
     application.add_handler(CallbackQueryHandler(job_bot.handle_callback))
 
     # Start bot
