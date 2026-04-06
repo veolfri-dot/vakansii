@@ -29,6 +29,32 @@ LEVEL_EMOJIS = {
     'Not specified': '⚪',
 }
 
+# Эмодзи для match score
+MATCH_SCORE_EMOJIS = {
+    'excellent': '🟢',   # >= 70%
+    'good': '🟡',        # >= 50%
+    'average': '🟠',     # >= 40%
+    'low': '⚪',         # < 40%
+}
+
+
+def get_match_score_emoji(score: float) -> str:
+    """Получение эмодзи для match score"""
+    if score >= 0.7:
+        return MATCH_SCORE_EMOJIS['excellent']
+    elif score >= 0.5:
+        return MATCH_SCORE_EMOJIS['good']
+    elif score >= 0.4:
+        return MATCH_SCORE_EMOJIS['average']
+    return MATCH_SCORE_EMOJIS['low']
+
+
+def format_match_score(score: float) -> str:
+    """Форматирование match score в строку с эмодзи"""
+    emoji = get_match_score_emoji(score)
+    percentage = int(score * 100)
+    return f"{emoji} {percentage}% match"
+
 # Названия категорий на русском
 CATEGORY_NAMES_RU = {
     'development': 'Разработка',
@@ -140,6 +166,7 @@ class JobMessageFormatter:
         salary = job.get('salary', 'Не указана')
         location = job.get('location', 'Remote')
         url = job.get('url', '')
+        match_score = job.get('match_score')
         
         cat_emoji = self._get_category_emoji(category)
         level_emoji = LEVEL_EMOJIS.get(level, '⚪')
@@ -149,8 +176,15 @@ class JobMessageFormatter:
             f"",
             f"🏢 _{self._escape_markdown_v2(company)}_",
             f"{self._format_location(location)}  |  {level_emoji} {self._escape_markdown_v2(level)}",
-            f"{self._format_salary(salary)}",
         ]
+        
+        # Добавляем match_score если есть
+        if match_score is not None:
+            match_emoji = get_match_score_emoji(match_score)
+            match_pct = int(match_score * 100)
+            lines.append(f"🎯 *{match_pct}%* подходит профилю")
+        
+        lines.append(f"{self._format_salary(salary)}")
         
         if url:
             lines.append(f"")
@@ -171,6 +205,8 @@ class JobMessageFormatter:
         skills = job.get('tags', [])
         source = job.get('source', 'Unknown')
         url = job.get('url', '')
+        match_score = job.get('match_score')
+        matching_technologies = job.get('matching_technologies', [])
         
         cat_emoji = self._get_category_emoji(category)
         level_emoji = LEVEL_EMOJIS.get(level, '⚪')
@@ -188,6 +224,20 @@ class JobMessageFormatter:
             f"📂 Категория: {self._escape_markdown_v2(category_name)}",
             f"{self._format_location(location)}  |  {level_emoji} {self._escape_markdown_v2(level)}",
             f"{self._format_salary(salary)}",
+        ]
+        
+        # Добавляем match_score если есть
+        if match_score is not None:
+            match_emoji = get_match_score_emoji(match_score)
+            match_pct = int(match_score * 100)
+            lines.append(f"🎯 {match_emoji} *{match_pct}%* соответствие профилю")
+            
+            # Показываем совпадающие технологии
+            if matching_technologies:
+                techs_str = ', '.join(matching_technologies[:5])
+                lines.append(f"✅ Совпадения: {self._escape_markdown_v2(techs_str)}")
+        
+        lines.extend([
             f"",
             f"📋 _Описание:_",
             f"{self._escape_markdown_v2(desc_text)}",
@@ -196,7 +246,7 @@ class JobMessageFormatter:
             f"{self._format_skills(skills)}",
             f"",
             f"📡 _Источник:_ {self._escape_markdown_v2(source)}",
-        ]
+        ])
         
         if url:
             lines.append(f"")
@@ -527,16 +577,77 @@ class JobMessageFormatter:
             company = job.get('company', 'Не указана')
             level = job.get('level', 'Junior')
             category = job.get('category', 'other')
+            match_score = job.get('match_score')
             
             cat_emoji = self._get_category_emoji(category)
             level_emoji = LEVEL_EMOJIS.get(level, '⚪')
             
-            lines.append(f"• {cat_emoji} *{self._escape_markdown_v2(title)}* @ {self._escape_markdown_v2(company)} {level_emoji}")
+            match_text = ""
+            if match_score is not None:
+                match_emoji = get_match_score_emoji(match_score)
+                match_pct = int(match_score * 100)
+                match_text = f" {match_emoji} *{match_pct}%*"
+            
+            lines.append(
+                f"• {cat_emoji} *{self._escape_markdown_v2(title)}* @ "
+                f"{self._escape_markdown_v2(company)} {level_emoji}{match_text}"
+            )
         
         if count > 3:
             lines.append(f"\n_...и ещё {count - 3} вакансий_")
         
         lines.append("\n👇 *Подробности в канале*")
+        
+        return '\n'.join(lines)
+    
+    def format_recommendations(self, jobs: List[Dict], limit: int = 5) -> str:
+        """
+        Форматирование персональных рекомендаций.
+        
+        Args:
+            jobs: Список вакансий с match_score
+            limit: Максимальное количество для отображения
+        
+        Returns:
+            Отформатированный текст
+        """
+        if not jobs:
+            return "😕 *Пока нет подходящих вакансий*\n\n" \
+                   "Попробуй расширить критерии в /settings"
+        
+        lines = ["🔥 *Персональная подборка для тебя:*\n"]
+        
+        for i, job in enumerate(jobs[:limit], 1):
+            title = job.get('title', 'Вакансия')
+            company = job.get('company', 'Не указана')
+            level = job.get('level', 'Junior')
+            category = job.get('category', 'other')
+            match_score = job.get('match_score', 0)
+            matching_techs = job.get('matching_technologies', [])
+            url = job.get('url', '')
+            
+            cat_emoji = self._get_category_emoji(category)
+            level_emoji = LEVEL_EMOJIS.get(level, '⚪')
+            match_emoji = get_match_score_emoji(match_score)
+            match_pct = int(match_score * 100)
+            
+            lines.append(
+                f"{i}. {match_emoji} *{match_pct}%* {cat_emoji} "
+                f"{self._escape_markdown_v2(title)}"
+            )
+            lines.append(f"   🏢 _{self._escape_markdown_v2(company)}_ | {level_emoji}")
+            
+            if matching_techs:
+                techs_str = ', '.join(matching_techs[:3])
+                lines.append(f"   ✅ {self._escape_markdown_v2(techs_str)}")
+            
+            if url:
+                lines.append(f"   [🔗 Открыть]({self._escape_url(url)})")
+            
+            lines.append("")
+        
+        if len(jobs) > limit:
+            lines.append(f"_...и ещё {len(jobs) - limit} вакансий_")
         
         return '\n'.join(lines)
     

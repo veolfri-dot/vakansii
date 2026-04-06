@@ -71,6 +71,20 @@ except ImportError:
     FORMATTER_AVAILABLE = False
     logging.warning("⚠️ message_formatter не найден, используется стандартное форматирование")
 
+try:
+    from smart_matching import SmartMatcher, create_user_profile, get_recommendations
+    SMART_MATCHING_AVAILABLE = True
+except ImportError:
+    SMART_MATCHING_AVAILABLE = False
+    logging.warning("⚠️ smart_matching не найден, Smart Matching отключен")
+
+try:
+    from salary_analyzer import SalaryAnalyzer, get_category_name_ru
+    SALARY_ANALYZER_AVAILABLE = True
+except ImportError:
+    SALARY_ANALYZER_AVAILABLE = False
+    logging.warning("⚠️ salary_analyzer не найден, Salary Insights отключен")
+
 # ==================== CONFIGURATION ====================
 class Config:
     """Application configuration with validation"""
@@ -1497,6 +1511,181 @@ class JobBot:
                 f"(Детальная настройка доступна с модулем форматирования)"
             )
 
+    async def cmd_recommendations(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /recommendations command - Personal job recommendations"""
+        user_id = update.effective_user.id
+        
+        # Проверяем, есть ли настройки пользователя
+        settings = await self.db.get_user_settings(user_id)
+        if not settings.get('onboarding_completed'):
+            await update.message.reply_text(
+                "⚙️ *Сначала настрой профиль!*\n\n"
+                "Используй команду /start для настройки предпочтений",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        if not SMART_MATCHING_AVAILABLE:
+            await update.message.reply_text(
+                "😕 *Smart Matching временно недоступен*\n\n"
+                "Попробуй позже или используй /search для поиска вакансий",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        # Показываем, что идёт обработка
+        processing_msg = await update.message.reply_text(
+            "🔍 *Подбираю вакансии под твой профиль...*",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        
+        try:
+            # Получаем свежие вакансии (за последние 7 дней)
+            week_ago = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
+            results = await self.db.fetchall(
+                'SELECT hash, title, company, level, category, url, description, posted_at '
+                'FROM posted_jobs '
+                'WHERE date(posted_at) >= ? '
+                'ORDER BY posted_at DESC LIMIT 200',
+                (week_ago,)
+            )
+            
+            if not results:
+                await processing_msg.edit_text(
+                    "😕 *Пока нет подходящих вакансий*\n\n"
+                    "Попробуй расширить критерии в /settings или проверь позже!",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                return
+            
+            # Преобразуем в список словарей
+            recent_jobs = []
+            for row in results:
+                recent_jobs.append({
+                    'hash': row[0],
+                    'title': row[1],
+                    'company': row[2],
+                    'level': row[3],
+                    'category': row[4],
+                    'url': row[5],
+                    'description': row[6] or '',
+                    'posted_at': row[7],
+                    'tags': []
+                })
+            
+            # Создаём профиль пользователя
+            profile = create_user_profile(
+                level_preference=settings.get('level_preference', 'both'),
+                categories=settings.get('enabled_categories', []),
+                technologies=settings.get('technologies', [])
+            )
+            
+            # Фильтруем через Smart Matching
+            matcher = SmartMatcher(profile)
+            matched_jobs = matcher.filter_and_sort_jobs(recent_jobs, min_score=0.4)
+            
+            if not matched_jobs:
+                await processing_msg.edit_text(
+                    "😕 *Пока нет подходящих вакансий*\n\n"
+                    "Попробуй расширить критерии в /settings или проверь позже!",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                return
+            
+            # Форматируем результат
+            if self.formatter:
+                message = self.formatter.format_recommendations(matched_jobs, limit=5)
+                await processing_msg.edit_text(
+                    message,
+                    parse_mode=ParseMode.MARKDOWN,
+                    disable_web_page_preview=True
+                )
+            else:
+                # Fallback форматирование
+                lines = ["🔥 *Подборка для тебя:*\n"]
+                for i, job in enumerate(matched_jobs[:5], 1):
+                    score = job.get('match_score', 0)
+                    emoji = "🟢" if score > 0.7 else "🟡" if score > 0.5 else "🟠"
+                    lines.append(
+                        f"{i}. {emoji} {job['title']} @ {job['company']} "
+                        f"({int(score*100)}%)"
+                    )
+                await processing_msg.edit_text(
+                    '\n'.join(lines),
+                    parse_mode=ParseMode.MARKDOWN,
+                    disable_web_page_preview=True
+                )
+                
+        except Exception as e:
+            logger.error(f"Error in recommendations: {e}")
+            await processing_msg.edit_text(
+                "❌ *Ошибка при подборе вакансий*\n\n"
+                "Попробуй ещё раз позже",
+                parse_mode=ParseMode.MARKDOWN
+            )
+
+    async def cmd_salary(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /salary command - Salary statistics"""
+        args = context.args
+        
+        if not SALARY_ANALYZER_AVAILABLE:
+            await update.message.reply_text(
+                "😕 *Salary Insights временно недоступен*\n\n"
+                "Попробуй позже",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        
+        analyzer = SalaryAnalyzer(self.db)
+        
+        if not args:
+            # Показываем статистику по всем категориям для Junior/Middle
+            message = "💰 *Зарплатная статистика (Junior/Middle, за 30 дней)*\n\n"
+            
+            categories = ['development', 'qa', 'devops', 'data', 'design']
+            has_data = False
+            
+            for cat in categories:
+                junior = await analyzer.get_stats_by_category(cat, 'junior')
+                middle = await analyzer.get_stats_by_category(cat, 'middle')
+                
+                if junior.sample_size > 0 or middle.sample_size > 0:
+                    has_data = True
+                    cat_name = get_category_name_ru(cat)
+                    message += f"📊 *{cat_name}*\n"
+                    if junior.sample_size > 0:
+                        message += f"  🟢 Junior: ${junior.avg_min:,} - ${junior.avg_max:,} ({junior.sample_size} вак.)\n"
+                    if middle.sample_size > 0:
+                        message += f"  🔵 Middle: ${middle.avg_min:,} - ${middle.avg_max:,} ({middle.sample_size} вак.)\n"
+                    message += "\n"
+            
+            if not has_data:
+                message = (
+                    "😕 *Недостаточно данных для статистики*\n\n"
+                    "Попробуй позже, когда накопится больше вакансий."
+                )
+            else:
+                message += "\n💡 *Использование:*\n`/salary python` — статистика по Python\n`/salary react` — статистика по React"
+        else:
+            # Показываем по конкретной технологии
+            tech = args[0].lower()
+            stats = await analyzer.get_stats_by_technology(tech)
+            
+            if stats.sample_size > 0:
+                message = (
+                    f"💰 *{tech.capitalize()}*\n\n"
+                    f"💵 Средняя зарплата: *${stats.average_salary:,}*\n"
+                    f"📋 Выборка: {stats.sample_size} вакансий\n"
+                    f"📅 Период: 30 дней"
+                )
+            else:
+                message = f"😕 *Недостаточно данных для {tech}*\n\nПопробуй другую технологию."
+        
+        await update.message.reply_text(
+            message,
+            parse_mode=ParseMode.MARKDOWN
+        )
+
     async def cmd_pause(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /pause command"""
         if not await self.check_admin(update):
@@ -1746,7 +1935,7 @@ class JobBot:
             return
 
         elif data == 'salary_stats':
-            await query.answer("В разработке!")
+            await self.cmd_salary(update, context)
             return
 
         elif data == 'favorites':
@@ -2131,6 +2320,8 @@ async def main():
     logger.info(f"📱 Telegram channels: {Config.ENABLE_TELEGRAM_CHANNELS}")
     logger.info(f"🧠 Classifier: {CLASSIFIER_AVAILABLE}")
     logger.info(f"🎨 Formatter: {FORMATTER_AVAILABLE}")
+    logger.info(f"🎯 Smart Matching: {SMART_MATCHING_AVAILABLE}")
+    logger.info(f"💰 Salary Insights: {SALARY_ANALYZER_AVAILABLE}")
     if Config.ADMIN_USER_ID:
         logger.info(f"👤 Admin user ID: {Config.ADMIN_USER_ID}")
     logger.info("=" * 60)
@@ -2148,6 +2339,8 @@ async def main():
     application.add_handler(CommandHandler("last", job_bot.cmd_last))
     application.add_handler(CommandHandler("favorites", job_bot.cmd_favorites))
     application.add_handler(CommandHandler("categories", job_bot.cmd_categories))
+    application.add_handler(CommandHandler("recommendations", job_bot.cmd_recommendations))
+    application.add_handler(CommandHandler("salary", job_bot.cmd_salary))
     application.add_handler(CommandHandler("pause", job_bot.cmd_pause))
     application.add_handler(CommandHandler("resume", job_bot.cmd_resume))
     application.add_handler(CommandHandler("frequency", job_bot.cmd_frequency))
