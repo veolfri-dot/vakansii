@@ -23,6 +23,7 @@ import signal
 import asyncio
 import re
 import aiohttp
+import feedparser
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
     Application, CommandHandler, ContextTypes,
@@ -210,6 +211,15 @@ TECH_STACK = [
     'Java', 'C#', 'Go', 'Rust', 'PHP', 'Ruby', 'Swift', 'Kotlin'
 ]
 
+# RSS Feeds для парсинга
+RSS_FEEDS = {
+    "remotive": "https://remotive.com/feed",
+    "weworkremotely": "https://weworkremotely.com/remote-jobs.rss",
+    "remoteok": "https://remoteok.io/remote-jobs.rss",
+    "himalayas": "https://himalayas.app/jobs/rss",
+    "jobicy_rss": "https://jobicy.com/?feed=job_feed",
+}
+
 CATEGORY_NAMES_RU = {
     'development': 'Разработка',
     'qa': 'QA',
@@ -269,10 +279,15 @@ CIRCUIT_BREAKERS = {
     'arbeitnow': CircuitBreaker(),
     'himalayas': CircuitBreaker(),
     'weworkremotely': CircuitBreaker(),
-    'jobicy': CircuitBreaker(),
+    'jobicy': CircuitBreaker(failure_threshold=5, recovery_timeout=60),
     'adzuna': CircuitBreaker(),
     'headhunter': CircuitBreaker(),
     'superjob': CircuitBreaker(),
+    # RSS feed circuit breakers (мягче - RSS чаще недоступен)
+    'rss_remotive': CircuitBreaker(failure_threshold=3, recovery_timeout=30),
+    'rss_weworkremotely': CircuitBreaker(failure_threshold=3, recovery_timeout=30),
+    'rss_remoteok': CircuitBreaker(failure_threshold=3, recovery_timeout=30),
+    'rss_himalayas': CircuitBreaker(failure_threshold=3, recovery_timeout=30),
 }
 
 # ==================== DATABASE ====================
@@ -979,33 +994,87 @@ async def fetch_weworkremotely() -> List[Dict]:
         return []
 
 
-async def fetch_jobicy() -> List[Dict]:
-    """Jobicy API"""
+async def fetch_jobicy(count: int = 50, geo: str = None, industry: str = None) -> List[Dict]:
+    """Jobicy API - remote jobs with improved field mapping"""
     try:
-        url = "https://jobicy.com/api/v2/remote-jobs?count=50"
+        base_url = "https://jobicy.com/api/v2/remote-jobs"
+        params = {"count": min(count, 100)}
+        if geo:
+            params["geo"] = geo
+        if industry:
+            params["industry"] = industry
+        
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=get_headers(), timeout=aiohttp.ClientTimeout(total=15)) as response:
+            async with session.get(base_url, params=params, headers=get_headers(), timeout=aiohttp.ClientTimeout(total=15)) as response:
                 response.raise_for_status()
                 data = await response.json()
                 
                 jobs = []
-                for job in data.get('jobs', []):
+                for job in data.get("jobs", []):
                     jobs.append({
-                        'title': job.get('jobTitle', ''),
-                        'company': job.get('companyName', ''),
-                        'description': job.get('jobExcerpt', ''),
-                        'url': job.get('url', ''),
-                        'salary': '',
-                        'location': job.get('jobGeo', 'Remote'),
-                        'published': job.get('jobPosted', ''),
-                        'employment_type': job.get('jobType', ''),
-                        'source': 'Jobicy',
-                        'tags': []
+                        "title": job.get("jobTitle", ""),
+                        "company": job.get("companyName", ""),
+                        "description": job.get("jobDescription", ""),
+                        "url": job.get("url", ""),
+                        "salary": job.get("salary", ""),
+                        "location": job.get("jobGeo", "Remote"),
+                        "published": job.get("pubDate", ""),
+                        "employment_type": job.get("jobType", ""),
+                        "source": "Jobicy",
+                        "tags": job.get("tags", []),
                     })
-                
                 return jobs
     except Exception as e:
-        logger.error(f"❌ Jobicy error: {e}")
+        logger.error(f"Jobicy error: {e}")
+        return []
+
+
+def extract_company_from_title(title: str) -> str:
+    """Extract company name from job title (common RSS pattern: 'Job Title at Company')"""
+    if not title:
+        return "Unknown"
+    
+    # Common patterns: "at Company", "@ Company", "- Company", "| Company"
+    patterns = [
+        r'\s+at\s+(.+)$',
+        r'\s+@\s+(.+)$', 
+        r'\s+[-|]\s+(.+)$',
+        r'\s+\(([^)]+)\)$',  # Company in parentheses
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, title, re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+    
+    return "Unknown"
+
+
+async def parse_rss_feed(feed_url: str, source_name: str) -> List[Dict]:
+    """Parse RSS feed for job listings"""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(feed_url, headers=get_headers(), timeout=aiohttp.ClientTimeout(total=15)) as response:
+                if response.status == 200:
+                    content = await response.text()
+                    feed = feedparser.parse(content)
+                    
+                    jobs = []
+                    for entry in feed.entries[:20]:  # Берём последние 20
+                        job = {
+                            "title": entry.get("title", ""),
+                            "company": extract_company_from_title(entry.get("title", "")),
+                            "description": entry.get("description", ""),
+                            "url": entry.get("link", ""),
+                            "published": entry.get("published", ""),
+                            "source": source_name,
+                            "tags": [],
+                        }
+                        jobs.append(job)
+                    return jobs
+                return []
+    except Exception as e:
+        logger.error(f"RSS {source_name} error: {e}")
         return []
 
 
@@ -2110,6 +2179,14 @@ async def main():
         (fetch_adzuna, "Adzuna")
     ]
     
+    # RSS feed fetchers
+    rss_fetch_functions = [
+        (parse_rss_feed, RSS_FEEDS["remotive"], "Remotive RSS"),
+        (parse_rss_feed, RSS_FEEDS["weworkremotely"], "We Work Remotely RSS"),
+        (parse_rss_feed, RSS_FEEDS["remoteok"], "RemoteOK RSS"),
+        (parse_rss_feed, RSS_FEEDS["himalayas"], "Himalayas RSS"),
+    ]
+    
     while True:
         try:
             if job_bot.is_paused:
@@ -2125,21 +2202,52 @@ async def main():
                 for fetch_func, source_name in api_fetch_functions
             ]
             
+            # Fetch from RSS feeds
+            rss_tasks = [
+                safe_fetch_with_retry(lambda url=url, name=name: fetch_func(url, name), f"rss_{name.lower().replace(' ', '_')}")
+                for fetch_func, url, name in rss_fetch_functions
+            ]
+            
             # Add Telegram channels fetch if enabled
-            if Config.ENABLE_TELEGRAM_CHANNELS:
-                fetch_tasks.append(fetch_telegram_channels())
+            telegram_task = fetch_telegram_channels() if Config.ENABLE_TELEGRAM_CHANNELS else []
             
             # Execute all fetch tasks concurrently
-            results = await asyncio.gather(*fetch_tasks, return_exceptions=True)
+            all_results = await asyncio.gather(
+                *fetch_tasks,
+                *rss_tasks,
+                return_exceptions=True
+            )
             
             all_jobs = []
-            for i, result in enumerate(results):
+            api_results = all_results[:len(api_fetch_functions)]
+            rss_results = all_results[len(api_fetch_functions):len(api_fetch_functions) + len(rss_fetch_functions)]
+            
+            # Process API results
+            for i, result in enumerate(api_results):
                 if isinstance(result, Exception):
-                    logger.error(f"❌ Fetch error: {result}")
+                    logger.error(f"❌ API fetch error: {result}")
                     continue
-                source_name = api_fetch_functions[i][1] if i < len(api_fetch_functions) else "Telegram Channels"
+                source_name = api_fetch_functions[i][1]
                 all_jobs.extend(result)
                 logger.info(f"📥 Fetched {len(result)} jobs from {source_name}")
+            
+            # Process RSS results
+            for i, result in enumerate(rss_results):
+                if isinstance(result, Exception):
+                    logger.error(f"❌ RSS fetch error: {result}")
+                    continue
+                source_name = rss_fetch_functions[i][2]
+                all_jobs.extend(result)
+                logger.info(f"📥 Fetched {len(result)} jobs from {source_name}")
+            
+            # Process Telegram channels
+            if Config.ENABLE_TELEGRAM_CHANNELS and telegram_task:
+                try:
+                    tg_jobs = await telegram_task
+                    all_jobs.extend(tg_jobs)
+                    logger.info(f"📥 Fetched {len(tg_jobs)} jobs from Telegram channels")
+                except Exception as e:
+                    logger.error(f"❌ Telegram channels error: {e}")
             
             logger.info(f"📊 Total jobs fetched: {len(all_jobs)}")
             

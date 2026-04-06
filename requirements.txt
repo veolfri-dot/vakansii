@@ -11,3 +11,6 @@ telethon>=1.28.5
 
 # Optional: для продвинутой обработки дат
 # python-dateutil>=2.8.0
+
+# RSS feeds parsing
+feedparser>=6.0.0
