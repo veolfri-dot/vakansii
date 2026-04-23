@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 """
-Telegram Channel Bot for Junior/Middle Remote IT Jobs
-VERSION 6.0 - С улучшенными источниками, классификацией и форматированием
+Telegram Channel Bot for Junior/Middle Remote IT Jobs - WINDOWS VERSION
+VERSION 7.0 - v2.0 Relaxed Filters Edition
+
+Key differences from original:
+- Windows event loop policy fix
+- Synchronous main() function
+- Uses threading for background job collection (no JobQueue needed)
+- Uses application.run_polling() instead of asyncio.run()
 
 Новые возможности:
 - 10 Telegram-каналов в качестве источников (Telethon)
@@ -16,19 +22,24 @@ import aiosqlite
 import hashlib
 import logging
 import sys
+import threading
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
-import signal
 import asyncio
 import re
 import aiohttp
 import feedparser
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     Application, CommandHandler, ContextTypes,
-    CallbackQueryHandler, filters, ConversationHandler
+    CallbackQueryHandler, filters
 )
+
+
+# ==================== WINDOWS EVENT LOOP POLICY FIX ====================
+if sys.platform == 'win32':
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 # Import onboarding module
 try:
@@ -65,11 +76,20 @@ except ImportError:
     logging.warning("⚠️ telegram_job_parser не найден, Telegram-каналы отключены")
 
 try:
-    from message_formatter import JobMessageFormatter, format_job_message
+    from message_formatter import JobMessageFormatter, format_job_message, CATEGORY_EMOJIS, LEVEL_EMOJIS
     FORMATTER_AVAILABLE = True
 except ImportError:
     FORMATTER_AVAILABLE = False
     logging.warning("⚠️ message_formatter не найден, используется стандартное форматирование")
+    # Fallback emojis
+    CATEGORY_EMOJIS = {
+        'development': '💻', 'qa': '🧪', 'devops': '🔧', 'data': '📊',
+        'marketing': '📢', 'sales': '💼', 'pm': '📋', 'design': '🎨',
+        'support': '🎧', 'security': '🔒', 'other': '📌',
+    }
+    LEVEL_EMOJIS = {
+        'Junior': '🟢', 'Middle': '🔵', 'Senior': '🔴', 'Not specified': '⚪',
+    }
 
 try:
     from smart_matching import SmartMatcher, create_user_profile, get_recommendations
@@ -182,25 +202,71 @@ USER_AGENTS = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
 ]
 
+# ==================== EXPANDED FILTERS v2.0 ====================
+# Критическое изменение: намного более широкие фильтры для захвата всех IT вакансий
+
 JUNIOR_SIGNALS = [
+    # Оригинальные сигналы
     "junior", "jr", "jr.", "entry level", "entry-level", "entry",
     "trainee", "graduate", "начинающий", "начальный",
     "0-1 year", "0-2 years", "1 year", "1+ year", "1-2 years",
-    "no experience", "без опыта", "beginner"
+    "no experience", "без опыта", "beginner",
+    # НОВЫЕ: ключевые слова технологий (показываем все вакансии с этими технологиями)
+    'javascript', 'python', 'java', 'react', 'vue', 'angular',
+    'frontend', 'backend', 'fullstack', 'qa', 'тестировщик',
+    'devops', 'девопс', 'analyst', 'аналитик', 'support',
+    'data', 'ml', 'ai', 'blockchain', 'web3', 'mobile',
+    'ios', 'android', 'flutter', 'golang', 'rust', 'php',
+    'wordpress', '1c', 'bitrix', 'salesforce', 'crm',
+    'sql', 'nosql', 'mongodb', 'postgresql', 'mysql',
+    'docker', 'kubernetes', 'aws', 'azure', 'gcp',
+    'git', 'ci/cd', 'rest api', 'graphql',
+    'html', 'css', 'sass', 'tailwind',
+    'figma', 'sketch', 'ui/ux', 'дизайнер',
+    'java', 'c#', 'c++', 'swift', 'kotlin', 'dart',
+    'node.js', 'django', 'flask', 'fastapi', 'express', 'next.js',
+    'удаленно', 'remote', 'relocation', 'full remote', '100% remote',
+    'фриланс', 'freelance', 'contract', 'контракт',
+    'стажер', 'стажировка', 'intern', 'internship',
+    'младший', 'младшего', 'начинающего', 'junior+',
+    # Дополнительные роли
+    'developer', 'разработчик', 'programmer', 'программист',
+    'engineer', 'инженер', 'admin', 'админ', 'специалист',
+    'consultant', 'консультант', 'координатор',
 ]
 
 MIDDLE_SIGNALS = [
+    # Оригинальные
     "middle", "mid-level", "mid level", "intermediate",
-    "2-3 years", "2-4 years", "3-5 years", "2+ years", "3+ years"
+    "2-3 years", "2-4 years", "3-5 years", "2+ years", "3+ years",
+    # НОВЫЕ: включаем senior/lead вакансии тоже (для полноты)
+    "senior", "sr.", "sr ", "lead", "team lead", "tech lead",
+    "architect", "head of", "director", "manager",
+    "vp", "vice president", "cto", "cio", "c-level",
+    "старший", "ведущий", "руководитель", "главный",
+    "principal", "staff engineer", "chief",
+    "4+ years", "5+ years", "6+ years", "7+ years",
+    "expert", "эксперт", "мастер", "опытный",
+    # Расширенные должности
+    "product", "продукт", "project", "проект",
+    "scrum master", "product owner", "agile coach",
 ]
 
+# СИЛЬНО сокращаем список исключений - только явный спам/мошенничество
 EXCLUDE_SIGNALS = [
-    "senior", "sr.", "sr ", "lead", "principal", "staff engineer",
-    "architect", "head of", "director", "manager", "vp",
-    "vice president", "cto", "cfo", "chief", "c-level",
-    "старший", "ведущий", "руководитель", "главный"
+    # Только казино/ставки/порно/mlm
+    "казино", "casino", "ставки", "беттинг", "betting",
+    "букмекер", "порно", "porn", "adult", "18+", "xxx",
+    "эротика", "intim", "эскорт", "escort",
+    "mlm", "пирамида", "pyramid", 
+    "быстрые деньги", "quick money", "easy money",
+    " FOREX ", "форекс", "binary options", "бинарные опционы",
+    "казино", "лотерея", "lottery", "лото",
+    "work from phone", "работа с телефона",
+    "500$ в день", "1000$ в неделю", "$500", "$1000 за",
 ]
 
+# Расширенный список IT ролей
 IT_ROLES = [
     "developer", "engineer", "programmer", "designer", "qa", "tester",
     "analyst", "frontend", "backend", "full-stack", "fullstack",
@@ -209,10 +275,38 @@ IT_ROLES = [
     "python", "javascript", "java", "php", "ruby", "go", "rust",
     "node", "web developer", "software", "support engineer",
     "разработчик", "программист", "инженер", "тестировщик",
-    "менеджер проекта", "product owner", "scrum master"
+    "менеджер проекта", "product owner", "scrum master",
+    # НОВЫЕ:
+    "admin", "администратор", "админ", "dba", "database",
+    "security", "безопасность", "sysadmin", "сисадмин",
+    "sre", "site reliability", "platform engineer",
+    "ml engineer", "ai engineer", "data engineer",
+    "blockchain developer", "web3 developer", "solidity",
+    "game developer", "unity", "unreal", "gamedev",
+    "embedded", "firmware", "hardware", "iot",
+    "bi developer", "etl", "data warehouse",
+    "technical writer", "технический писатель",
+    "ux researcher", "product designer", "graphic designer",
+    "motion designer", "3d artist", "video editor",
+    "seo specialist", "marketing", "маркетинг",
+    "content manager", "контент менеджер",
+    "sales", "продажи", "business development",
+    "hr", "recruiter", "рекрутер", "talent acquisition",
+    "customer support", "техподдержка", "helpdesk",
+    "it manager", "team lead", "tech lead", "cto", "cio",
 ]
 
-REMOTE_KEYWORDS = ["remote", "удаленно", "удалённо", "work from home", "дистанционно", "wfh"]
+REMOTE_KEYWORDS = [
+    "remote", "удаленно", "удалённо", "work from home", 
+    "дистанционно", "wfh", "work remotely", "удаленная работа",
+    "remote work", "fully remote", "100% remote", "full remote",
+    "remote first", "remote-friendly", "distributed team",
+    " relocation", "релокация", "relocate", " relocate ",
+    "anywhere", "worldwide", "global", "international",
+    "work from anywhere", "работа из любой точки",
+    "гибрид", "hybrid", "частично удаленно", "partially remote",
+    "office optional", "удаленка", "удалёнка",
+]
 
 TECH_STACK = [
     'Python', 'JavaScript', 'TypeScript', 'React', 'Vue', 'Angular',
@@ -530,9 +624,6 @@ class DatabaseConnection:
                 INSERT OR REPLACE INTO user_settings 
                 (user_id, notification_frequency, updated_at)
                 VALUES (?, ?, CURRENT_TIMESTAMP)
-                ON CONFLICT(user_id) DO UPDATE SET
-                notification_frequency = excluded.notification_frequency,
-                updated_at = CURRENT_TIMESTAMP
             """, (user_id, frequency))
             return True
         except Exception as e:
@@ -603,19 +694,33 @@ def generate_job_hash(job: Dict) -> str:
 
 
 async def is_duplicate_job(job: Dict, db: DatabaseConnection) -> bool:
-    """Check and register job deduplication with cleanup"""
-    # Cleanup old records (>7 days)
-    cleanup_threshold = datetime.now() - timedelta(days=7)
-    await db.execute('DELETE FROM posted_jobs WHERE posted_at < ?', (cleanup_threshold,))
-
+    """Check and register job deduplication with TTL 24 hours - ИСПРАВЛЕННАЯ v2.3"""
+    
     job_hash = generate_job_hash(job)
-    job['hash'] = job_hash  # Сохраняем hash в job для дальнейшего использования
-
-    # Check if exists
-    result = await db.fetchone('SELECT 1 FROM posted_jobs WHERE hash = ?', (job_hash,))
+    job['hash'] = job_hash
+    
+    title = job.get('title', 'N/A')[:60]
+    url = job.get('url', '')[:60]
+    
+    # === TTL 24 ЧАСА: Проверяем дубликаты только за последние 24 часа ===
+    # Это позволяет публиковать вакансии, которые были опубликованы >24 часов назад
+    one_day_ago = datetime.now() - timedelta(hours=24)
+    
+    result = await db.fetchone(
+        'SELECT 1 FROM posted_jobs WHERE hash = ? AND posted_at > ?', 
+        (job_hash, one_day_ago)
+    )
+    
     if result:
-        logger.debug(f"⏭️ Duplicate skipped: {job.get('title', 'N/A')}")
+        logger.info(f"   ❌ DUPLICATE (last 24h): {title}...")
         return True
+    
+    # === ОПЦИОНАЛЬНО: Удаляем старые записи этого же URL (старше 24 часов) ===
+    # Это очищает базу от устаревших записей
+    await db.execute(
+        'DELETE FROM posted_jobs WHERE hash = ? AND posted_at <= ?',
+        (job_hash, one_day_ago)
+    )
 
     # Register new job
     await db.execute(
@@ -624,13 +729,13 @@ async def is_duplicate_job(job: Dict, db: DatabaseConnection) -> bool:
             job_hash,
             job.get('title', ''),
             job.get('company', ''),
-            job.get('level', 'Junior'),
+            job.get('level', 'Middle'),
             job.get('url', ''),
             job.get('source', ''),
             job.get('category', 'other')
         )
     )
-    logger.debug(f"💾 Saved new job: {job.get('title', 'N/A')}")
+    logger.debug(f"   💾 SAVED new job: {title}...")
     return False
 
 # ==================== UTILS ====================
@@ -675,20 +780,88 @@ async def safe_fetch_with_retry(fetch_func, source_name: str, max_retries: int =
 
 # ==================== JOB PROCESSING ====================
 def classify_job_level(job_data: Dict) -> Optional[str]:
-    """Classify job level with exclusion logic"""
-    full_text = f"{job_data.get('title', '')} {job_data.get('description', '')}".lower()
-
-    # Exclude senior+ roles first
-    if any(word in full_text for word in EXCLUDE_SIGNALS):
+    """
+    Классификация уровня вакансии - ИСПРАВЛЕННАЯ ВЕРСИЯ v2.3
+    СТРОГИЙ ПРИОРИТЕТ: Title → Description
+    Junior-маркеры в title имеют АБСОЛЮТНЫЙ приоритет
+    """
+    title = job_data.get('title', '')
+    description = job_data.get('description', '')
+    full_text = f"{title} {description}".lower()
+    title_lower = title.lower()
+    
+    logger.debug(f"🔍 Checking job: {title[:80]}...")
+    
+    # Проверяем на спам/казино/мошенничество
+    spam_keywords = ['казино', 'ставки', 'порно', 'xxx', 'букмекер', 'форекс', 'бинарные опционы', 'betting', 'casino']
+    found_spam = [word for word in spam_keywords if word in full_text]
+    if found_spam:
+        logger.debug(f"   ❌ SPAM detected: {found_spam}")
         return None
-
-    if any(signal in full_text for signal in JUNIOR_SIGNALS):
+    
+    # Проверяем что это IT вакансия
+    it_keywords = IT_ROLES + TECH_STACK
+    has_it = any(kw in full_text for kw in it_keywords)
+    if not has_it:
+        logger.debug(f"   ❌ NO IT keywords found")
+        return None
+    
+    # === ПРИОРИТЕТ 1 (ВЫСШИЙ): Проверяем JUNIOR в TITLE ===
+    # Эти маркеры в заголовке имеют абсолютный приоритет!
+    junior_title_strict = [
+        'junior', 'jr.', 'jr ', 'entry-level', 'entry level', 
+        'intern ', 'internship', 'trainee', 'graduate',
+        'стажер', 'стажировка', 'начинающий', 'младший',
+        '0-1 year', '0-2 years', 'no experience', 'без опыта'
+    ]
+    
+    # Добавляем проверку с пробелами для точности
+    title_with_spaces = f" {title_lower} "
+    if any(kw in title_lower for kw in junior_title_strict):
+        found = [kw for kw in junior_title_strict if kw in title_lower]
+        logger.info(f"   ✅ JUNIOR level (strict title match: {found[:2]}) - {title[:60]}")
         return "Junior"
-    if any(signal in full_text for signal in MIDDLE_SIGNALS):
+    
+    # === ПРИОРИТЕТ 2: Проверяем SENIOR в TITLE ===
+    senior_title_strict = [
+        'senior', 'sr.', 'sr ', 'staff ', 'principal', 
+        'lead ', 'architect', 'head of', 'director',
+        ' vp ', 'vice president', 'cto', 'cio', 'cfo',
+        'старший', 'ведущий', 'главный', 'руководитель'
+    ]
+    
+    if any(kw in title_lower for kw in senior_title_strict):
+        found = [kw for kw in senior_title_strict if kw in title_lower]
+        logger.info(f"   ✅ SENIOR level (title match: {found[:2]}) - {title[:60]}")
+        return "Senior"
+    
+    # === ПРИОРИТЕТ 3: Проверяем MIDDLE в TITLE ===
+    middle_title_signals = [
+        'middle', 'mid-level', 'experienced',
+        '2+ years', '3+ years', '4+ years', '5+ years'
+    ]
+    
+    if any(kw in title_lower for kw in middle_title_signals):
+        found = [kw for kw in middle_title_signals if kw in title_lower]
+        logger.info(f"   ✅ MIDDLE level (title match: {found[:2]}) - {title[:60]}")
         return "Middle"
-    if any(role in full_text for role in IT_ROLES):
+    
+    # === ПРИОРИТЕТ 4: Title не содержит маркеров → проверяем DESCRIPTION ===
+    logger.debug(f"   ⚠️ No level markers in title, checking description...")
+    
+    # Junior в описании
+    if any(kw in description.lower() for kw in ['junior', 'entry-level', 'trainee', 'стажер']):
+        logger.info(f"   ✅ JUNIOR level (found in description) - {title[:60]}")
         return "Junior"
-    return None
+    
+    # Senior в описании (но не в заголовке) → скорее Middle
+    if any(kw in description.lower() for kw in ['5+ years', '6+ years', '7+ years', '8+ years']):
+        logger.info(f"   ✅ MIDDLE level (senior exp in description, but not in title) - {title[:60]}")
+        return "Middle"
+    
+    # === DEFAULT ===
+    logger.info(f"   ✅ DEFAULT MIDDLE (no clear level signals) - {title[:60]}")
+    return "Middle"
 
 
 def auto_classify_category(job: Dict) -> str:
@@ -781,11 +954,66 @@ def extract_description(job: Dict, max_length: int = 350) -> str:
 
 
 def is_suitable_job(job: Dict) -> bool:
-    """Check if job matches criteria (remote + IT role)"""
-    text = f"{job['title']} {job.get('description', '')}".lower()
-    has_remote = any(kw in text for kw in REMOTE_KEYWORDS)
-    has_it_role = any(role in text for role in IT_ROLES)
-    return has_remote and has_it_role
+    """
+    Проверка подходит ли вакансия - УЛУЧШЕННАЯ ВЕРСИЯ v2.1 (с логированием)
+    Критерии: remote + IT (любой)
+    """
+    title = job.get('title', '')
+    description = job.get('description', '')
+    text = f"{title} {description}".lower()
+    title_lower = title.lower()
+    
+    logger.debug(f"📝 Checking suitability: {title[:80]}...")
+    
+    # 1. Проверяем что это не спам
+    spam_signals = ['казино', 'ставки', 'порно', 'xxx', 'форекс', 'бинарные опционы', 'betting', 'casino']
+    found_spam = [s for s in spam_signals if s in text]
+    if found_spam:
+        logger.debug(f"   ❌ SPAM: {found_spam}")
+        return False
+    
+    # 2. Проверяем удаленную работу
+    found_remote = [kw for kw in REMOTE_KEYWORDS if kw in text]
+    has_remote = len(found_remote) > 0
+    
+    # 3. Проверяем IT роли
+    found_it_roles = [role for role in IT_ROLES if role in text]
+    has_it_role = len(found_it_roles) > 0
+    
+    # 4. Проверяем технологии
+    found_tech = [tech for tech in TECH_STACK if tech.lower() in text]
+    has_tech = len(found_tech) > 0
+    
+    # Логируем что нашли
+    logger.debug(f"   Remote: {found_remote[:3] if found_remote else 'NO'}")
+    logger.debug(f"   IT roles: {found_it_roles[:3] if found_it_roles else 'NO'}")
+    logger.debug(f"   Tech: {found_tech[:3] if found_tech else 'NO'}")
+    
+    # Вакансия подходит если: удаленка + (IT роль ИЛИ технологии)
+    is_suitable = has_remote and (has_it_role or has_tech)
+    
+    # ⚠️ FALLBACK: Если в заголовке есть сильные IT сигналы - принимаем даже без явного remote
+    # (многие вакансии remote не помечают явно, особенно на HeadHunter)
+    if not is_suitable and not has_remote:
+        strong_it_signals = ['developer', 'разработчик', 'engineer', 'инженер', 'программист',
+                            'devops', 'девопс', 'data scientist', 'ml engineer', 'backend', 'frontend']
+        has_strong_it = any(s in title_lower for s in strong_it_signals)
+        
+        # Если в заголовке есть сильный IT сигнал и есть технологии - принимаем
+        if has_strong_it and has_tech:
+            logger.info(f"   ⚠️ FALLBACK ACCEPTED (no remote keyword but strong IT): {title[:60]}...")
+            is_suitable = True
+    
+    if is_suitable:
+        logger.debug(f"   ✅ SUITABLE - will classify")
+    else:
+        if not has_remote:
+            logger.debug(f"   ❌ NOT SUITABLE: no remote keywords (and no strong IT fallback)")
+        elif not (has_it_role or has_tech):
+            logger.debug(f"   ❌ NOT SUITABLE: no IT roles or tech found")
+            logger.debug(f"   Text sample: {text[:150]}...")
+    
+    return is_suitable
 
 
 def format_job_message_legacy(job: Dict) -> str:
@@ -943,8 +1171,9 @@ async def fetch_arbeitnow() -> List[Dict]:
 
 
 async def fetch_himalayas() -> List[Dict]:
-    """Himalayas API"""
+    """Himalayas API - с fallback"""
     try:
+        # Try v1 first
         url = "https://himalayas.app/api/v1/jobs"
         params = {'limit': 30, 'remote': 'true'}
         async with aiohttp.ClientSession() as session:
@@ -979,11 +1208,17 @@ async def fetch_himalayas() -> List[Dict]:
 
 
 async def fetch_weworkremotely() -> List[Dict]:
-    """We Work Remotely JSON API"""
+    """We Work Remotely JSON API - с улучшенными headers"""
     try:
         url = "https://weworkremotely.com/remote-jobs.json"
+        headers = {
+            **get_headers(),
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Referer': 'https://weworkremotely.com/',
+        }
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=get_headers(), timeout=aiohttp.ClientTimeout(total=15)) as response:
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as response:
                 response.raise_for_status()
                 data = await response.json()
                 
@@ -1279,6 +1514,7 @@ async def fetch_telegram_channels() -> List[Dict]:
         logger.error(f"❌ Telegram channels error: {e}")
         return []
 
+
 # ==================== TELEGRAM BOT ====================
 class JobBot:
     """Telegram bot with enhanced features"""
@@ -1289,6 +1525,15 @@ class JobBot:
         self.is_paused = False
         self.formatter = JobMessageFormatter() if FORMATTER_AVAILABLE else None
         self.classifier = JobClassifier() if CLASSIFIER_AVAILABLE else None
+
+    def get_main_keyboard(self) -> ReplyKeyboardMarkup:
+        """Главное Reply Keyboard меню"""
+        keyboard = [
+            ['🔍 Поиск', '🔥 Горячие'],
+            ['⭐ Избранное', '⚙️ Настройки'],
+            ['📊 Статистика', '❓ Помощь']
+        ]
+        return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
     async def check_admin(self, update: Update) -> bool:
         """Check if user is admin"""
@@ -1355,6 +1600,13 @@ class JobBot:
             welcome_text,
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=start_keyboard
+        )
+        
+        # Отправляем второе сообщение с Reply Keyboard (постоянное меню)
+        await update.message.reply_text(
+            "📱 *Главное меню:*",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=self.get_main_keyboard()
         )
 
     async def _start_onboarding(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1802,7 +2054,7 @@ class JobBot:
             lines.append(
                 f"{cat_emoji} *{self._escape_markdown_v2(job['title'])}*\n"
                 f"🏢 _{self._escape_markdown_v2(job['company'])}_ \\| {level_emoji}\n"
-                f"[🔗 Открыть]({self._escape_url(job['url'])})\n"
+                f"[🔗 Открыть]({self._escape_markdown_v2(job['url'])})\n"
             )
         
         # Build pagination keyboard
@@ -1848,6 +2100,7 @@ class JobBot:
         if not url:
             return ''
         return url.replace(')', '%29').replace('\\', '%5C').replace('|', '%7C')
+
 
     async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle inline keyboard callbacks - Enhanced with onboarding and search"""
@@ -2312,58 +2565,85 @@ class JobBot:
             logger.error(f"❌ Failed to post job: {e}")
             return False
 
-# ==================== MAIN LOOP ====================
-async def main():
-    """Main application loop"""
-    logger.info("=" * 60)
-    logger.info("🚀 Job Bot Starting (v6.0 - Enhanced Edition)")
-    logger.info(f"📡 Channel: {Config.CHANNEL_ID}")
-    logger.info(f"⏱️ Check interval: {Config.CHECK_INTERVAL}s")
-    logger.info(f"📊 Max posts per cycle: {Config.MAX_POSTS_PER_CYCLE}")
-    logger.info(f"🤖 MarkdownV2: {Config.ENABLE_MARKDOWN_V2}")
-    logger.info(f"📱 Telegram channels: {Config.ENABLE_TELEGRAM_CHANNELS}")
-    logger.info(f"🧠 Classifier: {CLASSIFIER_AVAILABLE}")
-    logger.info(f"🎨 Formatter: {FORMATTER_AVAILABLE}")
-    logger.info(f"🎯 Smart Matching: {SMART_MATCHING_AVAILABLE}")
-    logger.info(f"💰 Salary Insights: {SALARY_ANALYZER_AVAILABLE}")
-    if Config.ADMIN_USER_ID:
-        logger.info(f"👤 Admin user ID: {Config.ADMIN_USER_ID}")
-    logger.info("=" * 60)
+    # ==================== REPLY KEYBOARD HANDLERS ====================
+    async def cmd_search_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка 🔍 Поиск из Reply Keyboard"""
+        await update.message.reply_text(
+            "🔍 *Поиск по вакансиям*\n\n"
+            "Введите запрос для поиска:\n"
+            "`/search python junior`\n"
+            "`/search react remote`\n"
+            "`/search golang middle`",
+            parse_mode=ParseMode.MARKDOWN
+        )
 
-    # Initialize database
-    db = await init_database()
+    async def cmd_hot_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка 🔥 Горячие из Reply Keyboard"""
+        # Используем существующий метод _show_hot_jobs
+        # Создаем фейковый callback_query для совместимости
+        class FakeQuery:
+            def __init__(self, update):
+                self.update = update
+            async def edit_message_text(self, *args, **kwargs):
+                await self.update.message.reply_text(*args, **kwargs)
+            async def answer(self, *args, **kwargs):
+                pass
+        
+        fake_update = type('obj', (object,), {'callback_query': FakeQuery(update), 'effective_user': update.effective_user})()
+        await self._show_hot_jobs(fake_update, context)
 
-    # Setup Telegram bot
-    application = Application.builder().token(Config.TELEGRAM_BOT_TOKEN).build()
-    job_bot = JobBot(application, db)
+    async def cmd_settings_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка ⚙️ Настройки из Reply Keyboard"""
+        await update.message.reply_text(
+            "⚙️ *Настройки*\n\n"
+            "Доступные команды:\n"
+            "• /categories - Настроить категории\n"
+            "• /frequency - Частота уведомлений\n"
+            "• /recommendations - Персональные рекомендации\n\n"
+            "Или используйте инлайн-меню ниже:",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📂 Категории", callback_data="categories")],
+                [InlineKeyboardButton("🔔 Частота уведомлений", callback_data="settings")]
+            ])
+        )
 
-    # Register command handlers
-    application.add_handler(CommandHandler("start", job_bot.cmd_start))
-    application.add_handler(CommandHandler("status", job_bot.cmd_status))
-    application.add_handler(CommandHandler("last", job_bot.cmd_last))
-    application.add_handler(CommandHandler("favorites", job_bot.cmd_favorites))
-    application.add_handler(CommandHandler("categories", job_bot.cmd_categories))
-    application.add_handler(CommandHandler("recommendations", job_bot.cmd_recommendations))
-    application.add_handler(CommandHandler("salary", job_bot.cmd_salary))
-    application.add_handler(CommandHandler("pause", job_bot.cmd_pause))
-    application.add_handler(CommandHandler("resume", job_bot.cmd_resume))
-    application.add_handler(CommandHandler("frequency", job_bot.cmd_frequency))
-    application.add_handler(CommandHandler("search", job_bot.cmd_search))
-    application.add_handler(CallbackQueryHandler(job_bot.handle_callback))
+    async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка ❓ Помощь из Reply Keyboard"""
+        help_text = (
+            "❓ *Помощь*\n\n"
+            "*Основные команды:*\n"
+            "• /start - Начать работу с ботом\n"
+            "• /search <запрос> - Поиск вакансий\n"
+            "• /favorites - Избранные вакансии\n"
+            "• /salary - Зарплатная статистика\n\n"
+            "*Навигация:*\n"
+            "Используйте кнопки ниже для быстрого доступа:\n"
+            "🔍 Поиск, 🔥 Горячие, ⭐ Избранное, ⚙️ Настройки\n\n"
+            "*Вопросы?*\n"
+            "Обратитесь к администратору."
+        )
+        await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
 
-    # Start bot
-    await application.initialize()
-    await application.start()
-    await application.updater.start_polling()
 
-    logger.info("✅ Telegram bot started with admin commands")
+def log_filter_stats(total_jobs: int, classified_jobs: int, posted_jobs: int):
+    """Логирование статистики фильтрации"""
+    logger.info(f"📊 FILTER STATS: Total={total_jobs}, Classified={classified_jobs}, Posted={posted_jobs}")
+    if total_jobs > 0:
+        classification_rate = (classified_jobs / total_jobs) * 100
+        logger.info(f"   Classification rate: {classification_rate:.1f}%")
 
-    # Setup graceful shutdown
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(shutdown(s, application, db)))
 
-    # Main collection loop
+# ==================== BACKGROUND JOB COLLECTION TASK ====================
+async def job_collection_task(job_bot: JobBot, db: DatabaseConnection):
+    """
+    Фоновая задача для сбора и публикации вакансий.
+    Работает в отдельной задаче asyncio параллельно с polling.
+    """
+    # Первый запуск через 10 секунд после старта бота
+    await asyncio.sleep(10)
+    
+    # API fetch functions
     api_fetch_functions = [
         (fetch_remotive, "Remotive"),
         (fetch_remoteok, "RemoteOK"),
@@ -2448,58 +2728,180 @@ async def main():
             
             logger.info(f"📊 Total jobs fetched: {len(all_jobs)}")
             
-            # Filter, classify and process
+            # Filter, classify and process - с подробным логированием
             classified_jobs = []
-            for job in all_jobs:
+            suitable_count = 0
+            level_rejected = 0
+            
+            logger.info("🔍 Starting job classification...")
+            
+            for i, job in enumerate(all_jobs):
+                title = job.get('title', 'N/A')[:60]
+                
+                # Проверка suitability
                 if not is_suitable_job(job):
+                    if i < 3:  # Логируем первые 3 для примера
+                        logger.info(f"   Job {i+1}: {title}... → NOT SUITABLE")
                     continue
+                
+                suitable_count += 1
                 
                 # Classify level
                 level = classify_job_level(job)
-                if level:
-                    job['level'] = level
-                else:
+                if not level:
+                    level_rejected += 1
+                    if i < 3:
+                        logger.info(f"   Job {i+1}: {title}... → NO LEVEL (rejected)")
                     continue
+                
+                job['level'] = level
                 
                 # Auto-classify category
                 category = auto_classify_category(job)
                 job['category'] = category
                 
                 classified_jobs.append(job)
+                logger.info(f"   ✅ ACCEPTED: {title}... [{level}] [{category}]")
             
-            logger.info(f"🎯 Suitable Junior/Middle jobs: {len(classified_jobs)}")
+            logger.info(f"📊 Filter pipeline: Total={len(all_jobs)}, Suitable={suitable_count}, Classified={len(classified_jobs)}, Level-rejected={level_rejected}")
             
             # Post jobs
             posted_count = 0
-            for job in classified_jobs[:Config.MAX_POSTS_PER_CYCLE]:
-                if not await is_duplicate_job(job, db):
-                    if await job_bot.post_job(job):
-                        posted_count += 1
-                        await asyncio.sleep(DELAYS['between_posts'])
+            duplicate_count = 0
             
-            logger.info(f"✅ Posted {posted_count} new jobs to channel")
-            logger.info(f"⏳ Waiting {Config.CHECK_INTERVAL//60} minutes before next cycle...")
-            await asyncio.sleep(Config.CHECK_INTERVAL)
+            for job in classified_jobs[:Config.MAX_POSTS_PER_CYCLE]:
+                if await is_duplicate_job(job, db):
+                    duplicate_count += 1
+                    logger.debug(f"   DUPLICATE: {job.get('title', 'N/A')[:60]}...")
+                    continue
+                    
+                if await job_bot.post_job(job):
+                    posted_count += 1
+                    logger.info(f"   📤 POSTED: {job.get('title', 'N/A')[:60]}...")
+                    await asyncio.sleep(DELAYS['between_posts'])
+                else:
+                    logger.warning(f"   ❌ FAILED to post: {job.get('title', 'N/A')[:60]}...")
+            
+            # Log filter statistics
+            log_filter_stats(len(all_jobs), len(classified_jobs), posted_count)
+            logger.info(f"✅ Posted {posted_count} new jobs to channel (duplicates skipped: {duplicate_count})")
             
         except Exception as e:
-            logger.error(f"❌ Error in main loop: {e}", exc_info=True)
-            await asyncio.sleep(300)
+            logger.error(f"❌ Error in job collection task: {e}", exc_info=True)
+        
+        # Ждем перед следующим циклом
+        await asyncio.sleep(Config.CHECK_INTERVAL)
 
 
-async def shutdown(signal, application, db):
-    """Graceful shutdown handler"""
-    logger.info(f"🛑 Received exit signal {signal.name}")
+def start_collection_thread(job_bot: JobBot, db: DatabaseConnection):
+    """
+    Запускает фоновую задачу сбора вакансий в отдельном потоке.
     
-    await application.stop()
-    await application.shutdown()
-    await db.close()
-    logger.info("👋 Bot shutdown complete")
-    sys.exit(0)
+    ⚠️ WINDOWS FIX: Используем threading вместо post_init callback,
+    т.к. post_init параметр недоступен в PTB 20.6
+    """
+    def run_collection():
+        """Функция для выполнения в отдельном потоке"""
+        # Создаем новый event loop для этого потока
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(job_collection_task(job_bot, db))
+        except Exception as e:
+            logger.error(f"❌ Error in collection thread: {e}", exc_info=True)
+        finally:
+            loop.close()
+    
+    # Запускаем поток
+    collection_thread = threading.Thread(target=run_collection, daemon=True)
+    collection_thread.start()
+    logger.info("✅ Background job collection thread started")
+
+
+# ==================== MAIN FUNCTION - WINDOWS VERSION ====================
+def main():
+    """
+    Main application entry point - WINDOWS VERSION.
+    
+    Key differences from original:
+    - This function is synchronous (not async)
+    - Uses application.run_polling() instead of asyncio.run(main())
+    - Uses post_init callback + create_task for job collection (no JobQueue required)
+    - No additional dependencies needed
+    """
+    logger.info("=" * 60)
+    logger.info("🚀 Job Bot Starting (v7.0 - v2.0 Relaxed Filters Edition)")
+    logger.info(f"📡 Channel: {Config.CHANNEL_ID}")
+    logger.info(f"⏱️ Check interval: {Config.CHECK_INTERVAL}s")
+    logger.info(f"📊 Max posts per cycle: {Config.MAX_POSTS_PER_CYCLE}")
+    logger.info(f"🤖 MarkdownV2: {Config.ENABLE_MARKDOWN_V2}")
+    logger.info(f"📱 Telegram channels: {Config.ENABLE_TELEGRAM_CHANNELS}")
+    logger.info(f"🧠 Classifier: {CLASSIFIER_AVAILABLE}")
+    logger.info(f"🎨 Formatter: {FORMATTER_AVAILABLE}")
+    logger.info(f"🎯 Smart Matching: {SMART_MATCHING_AVAILABLE}")
+    logger.info(f"💰 Salary Insights: {SALARY_ANALYZER_AVAILABLE}")
+    if Config.ADMIN_USER_ID:
+        logger.info(f"👤 Admin user ID: {Config.ADMIN_USER_ID}")
+    logger.info("=" * 60)
+
+    # ⚠️ WINDOWS FIX: Create event loop BEFORE any async operations
+    # This must be done FIRST, before any asyncio calls
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    # Initialize database using the created loop
+    db = loop.run_until_complete(init_database())
+
+    # Create Application
+    application = Application.builder().token(Config.TELEGRAM_BOT_TOKEN).build()
+    
+    # Create JobBot instance
+    job_bot = JobBot(application, db)
+    
+    # Store references in bot_data for access from callbacks
+    application.bot_data['job_bot'] = job_bot
+    application.bot_data['db'] = db
+
+    # Register command handlers
+    application.add_handler(CommandHandler("start", job_bot.cmd_start))
+    application.add_handler(CommandHandler("status", job_bot.cmd_status))
+    application.add_handler(CommandHandler("last", job_bot.cmd_last))
+    application.add_handler(CommandHandler("favorites", job_bot.cmd_favorites))
+    application.add_handler(CommandHandler("categories", job_bot.cmd_categories))
+    application.add_handler(CommandHandler("recommendations", job_bot.cmd_recommendations))
+    application.add_handler(CommandHandler("salary", job_bot.cmd_salary))
+    application.add_handler(CommandHandler("pause", job_bot.cmd_pause))
+    application.add_handler(CommandHandler("resume", job_bot.cmd_resume))
+    application.add_handler(CommandHandler("frequency", job_bot.cmd_frequency))
+    application.add_handler(CommandHandler("search", job_bot.cmd_search))
+    
+    # Обработчики Reply Keyboard (главное меню)
+    from telegram.ext import MessageHandler
+    application.add_handler(MessageHandler(filters.TEXT & filters.Regex('^🔍 Поиск$'), job_bot.cmd_search_menu))
+    application.add_handler(MessageHandler(filters.TEXT & filters.Regex('^🔥 Горячие$'), job_bot.cmd_hot_menu))
+    application.add_handler(MessageHandler(filters.TEXT & filters.Regex('^⭐ Избранное$'), job_bot.cmd_favorites))
+    application.add_handler(MessageHandler(filters.TEXT & filters.Regex('^⚙️ Настройки$'), job_bot.cmd_settings_menu))
+    application.add_handler(MessageHandler(filters.TEXT & filters.Regex('^📊 Статистика$'), job_bot.cmd_status))
+    application.add_handler(MessageHandler(filters.TEXT & filters.Regex('^❓ Помощь$'), job_bot.cmd_help))
+    
+    application.add_handler(CallbackQueryHandler(job_bot.handle_callback))
+
+    # ⚠️ WINDOWS FIX: Start background collection thread
+    start_collection_thread(job_bot, db)
+    logger.info(f"⏱️ Collection interval: {Config.CHECK_INTERVAL//60} minutes")
+
+    # Run the bot with polling
+    # The event loop is already set, so run_polling will use it
+    logger.info("🚀 Starting bot polling...")
+    application.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        main()
     except KeyboardInterrupt:
         logger.info("🛑 Bot stopped by user")
         sys.exit(0)
+    except Exception as e:
+        logger.error(f"❌ Fatal error: {e}", exc_info=True)
+        sys.exit(1)

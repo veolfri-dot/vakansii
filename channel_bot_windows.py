@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 """
-Telegram Channel Bot for Junior/Middle Remote IT Jobs
-VERSION 6.0 - С улучшенными источниками, классификацией и форматированием
+Telegram Channel Bot for Junior/Middle Remote IT Jobs - WINDOWS VERSION
+VERSION 6.1 - Windows Compatible without JobQueue
+
+Key differences from original:
+- Windows event loop policy fix
+- Synchronous main() function
+- Uses threading for background job collection (no JobQueue needed)
+- Uses application.run_polling() instead of asyncio.run()
 
 Новые возможности:
 - 10 Telegram-каналов в качестве источников (Telethon)
@@ -16,10 +22,10 @@ import aiosqlite
 import hashlib
 import logging
 import sys
+import threading
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
-import signal
 import asyncio
 import re
 import aiohttp
@@ -27,8 +33,13 @@ import feedparser
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import (
     Application, CommandHandler, ContextTypes,
-    CallbackQueryHandler, filters, ConversationHandler
+    CallbackQueryHandler, filters
 )
+
+
+# ==================== WINDOWS EVENT LOOP POLICY FIX ====================
+if sys.platform == 'win32':
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 # Import onboarding module
 try:
@@ -65,11 +76,20 @@ except ImportError:
     logging.warning("⚠️ telegram_job_parser не найден, Telegram-каналы отключены")
 
 try:
-    from message_formatter import JobMessageFormatter, format_job_message
+    from message_formatter import JobMessageFormatter, format_job_message, CATEGORY_EMOJIS, LEVEL_EMOJIS
     FORMATTER_AVAILABLE = True
 except ImportError:
     FORMATTER_AVAILABLE = False
     logging.warning("⚠️ message_formatter не найден, используется стандартное форматирование")
+    # Fallback emojis
+    CATEGORY_EMOJIS = {
+        'development': '💻', 'qa': '🧪', 'devops': '🔧', 'data': '📊',
+        'marketing': '📢', 'sales': '💼', 'pm': '📋', 'design': '🎨',
+        'support': '🎧', 'security': '🔒', 'other': '📌',
+    }
+    LEVEL_EMOJIS = {
+        'Junior': '🟢', 'Middle': '🔵', 'Senior': '🔴', 'Not specified': '⚪',
+    }
 
 try:
     from smart_matching import SmartMatcher, create_user_profile, get_recommendations
@@ -530,9 +550,6 @@ class DatabaseConnection:
                 INSERT OR REPLACE INTO user_settings 
                 (user_id, notification_frequency, updated_at)
                 VALUES (?, ?, CURRENT_TIMESTAMP)
-                ON CONFLICT(user_id) DO UPDATE SET
-                notification_frequency = excluded.notification_frequency,
-                updated_at = CURRENT_TIMESTAMP
             """, (user_id, frequency))
             return True
         except Exception as e:
@@ -1279,6 +1296,7 @@ async def fetch_telegram_channels() -> List[Dict]:
         logger.error(f"❌ Telegram channels error: {e}")
         return []
 
+
 # ==================== TELEGRAM BOT ====================
 class JobBot:
     """Telegram bot with enhanced features"""
@@ -1802,7 +1820,7 @@ class JobBot:
             lines.append(
                 f"{cat_emoji} *{self._escape_markdown_v2(job['title'])}*\n"
                 f"🏢 _{self._escape_markdown_v2(job['company'])}_ \\| {level_emoji}\n"
-                f"[🔗 Открыть]({self._escape_url(job['url'])})\n"
+                f"[🔗 Открыть]({self._escape_markdown_v2(job['url'])})\n"
             )
         
         # Build pagination keyboard
@@ -1848,6 +1866,7 @@ class JobBot:
         if not url:
             return ''
         return url.replace(')', '%29').replace('\\', '%5C').replace('|', '%7C')
+
 
     async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle inline keyboard callbacks - Enhanced with onboarding and search"""
@@ -2312,58 +2331,17 @@ class JobBot:
             logger.error(f"❌ Failed to post job: {e}")
             return False
 
-# ==================== MAIN LOOP ====================
-async def main():
-    """Main application loop"""
-    logger.info("=" * 60)
-    logger.info("🚀 Job Bot Starting (v6.0 - Enhanced Edition)")
-    logger.info(f"📡 Channel: {Config.CHANNEL_ID}")
-    logger.info(f"⏱️ Check interval: {Config.CHECK_INTERVAL}s")
-    logger.info(f"📊 Max posts per cycle: {Config.MAX_POSTS_PER_CYCLE}")
-    logger.info(f"🤖 MarkdownV2: {Config.ENABLE_MARKDOWN_V2}")
-    logger.info(f"📱 Telegram channels: {Config.ENABLE_TELEGRAM_CHANNELS}")
-    logger.info(f"🧠 Classifier: {CLASSIFIER_AVAILABLE}")
-    logger.info(f"🎨 Formatter: {FORMATTER_AVAILABLE}")
-    logger.info(f"🎯 Smart Matching: {SMART_MATCHING_AVAILABLE}")
-    logger.info(f"💰 Salary Insights: {SALARY_ANALYZER_AVAILABLE}")
-    if Config.ADMIN_USER_ID:
-        logger.info(f"👤 Admin user ID: {Config.ADMIN_USER_ID}")
-    logger.info("=" * 60)
 
-    # Initialize database
-    db = await init_database()
-
-    # Setup Telegram bot
-    application = Application.builder().token(Config.TELEGRAM_BOT_TOKEN).build()
-    job_bot = JobBot(application, db)
-
-    # Register command handlers
-    application.add_handler(CommandHandler("start", job_bot.cmd_start))
-    application.add_handler(CommandHandler("status", job_bot.cmd_status))
-    application.add_handler(CommandHandler("last", job_bot.cmd_last))
-    application.add_handler(CommandHandler("favorites", job_bot.cmd_favorites))
-    application.add_handler(CommandHandler("categories", job_bot.cmd_categories))
-    application.add_handler(CommandHandler("recommendations", job_bot.cmd_recommendations))
-    application.add_handler(CommandHandler("salary", job_bot.cmd_salary))
-    application.add_handler(CommandHandler("pause", job_bot.cmd_pause))
-    application.add_handler(CommandHandler("resume", job_bot.cmd_resume))
-    application.add_handler(CommandHandler("frequency", job_bot.cmd_frequency))
-    application.add_handler(CommandHandler("search", job_bot.cmd_search))
-    application.add_handler(CallbackQueryHandler(job_bot.handle_callback))
-
-    # Start bot
-    await application.initialize()
-    await application.start()
-    await application.updater.start_polling()
-
-    logger.info("✅ Telegram bot started with admin commands")
-
-    # Setup graceful shutdown
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(shutdown(s, application, db)))
-
-    # Main collection loop
+# ==================== BACKGROUND JOB COLLECTION TASK ====================
+async def job_collection_task(job_bot: JobBot, db: DatabaseConnection):
+    """
+    Фоновая задача для сбора и публикации вакансий.
+    Работает в отдельной задаче asyncio параллельно с polling.
+    """
+    # Первый запуск через 10 секунд после старта бота
+    await asyncio.sleep(10)
+    
+    # API fetch functions
     api_fetch_functions = [
         (fetch_remotive, "Remotive"),
         (fetch_remoteok, "RemoteOK"),
@@ -2478,28 +2456,113 @@ async def main():
                         await asyncio.sleep(DELAYS['between_posts'])
             
             logger.info(f"✅ Posted {posted_count} new jobs to channel")
-            logger.info(f"⏳ Waiting {Config.CHECK_INTERVAL//60} minutes before next cycle...")
-            await asyncio.sleep(Config.CHECK_INTERVAL)
             
         except Exception as e:
-            logger.error(f"❌ Error in main loop: {e}", exc_info=True)
-            await asyncio.sleep(300)
+            logger.error(f"❌ Error in job collection task: {e}", exc_info=True)
+        
+        # Ждем перед следующим циклом
+        await asyncio.sleep(Config.CHECK_INTERVAL)
 
 
-async def shutdown(signal, application, db):
-    """Graceful shutdown handler"""
-    logger.info(f"🛑 Received exit signal {signal.name}")
+def start_collection_thread(job_bot: JobBot, db: DatabaseConnection):
+    """
+    Запускает фоновую задачу сбора вакансий в отдельном потоке.
     
-    await application.stop()
-    await application.shutdown()
-    await db.close()
-    logger.info("👋 Bot shutdown complete")
-    sys.exit(0)
+    ⚠️ WINDOWS FIX: Используем threading вместо post_init callback,
+    т.к. post_init параметр недоступен в PTB 20.6
+    """
+    def run_collection():
+        """Функция для выполнения в отдельном потоке"""
+        # Создаем новый event loop для этого потока
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(job_collection_task(job_bot, db))
+        except Exception as e:
+            logger.error(f"❌ Error in collection thread: {e}", exc_info=True)
+        finally:
+            loop.close()
+    
+    # Запускаем поток
+    collection_thread = threading.Thread(target=run_collection, daemon=True)
+    collection_thread.start()
+    logger.info("✅ Background job collection thread started")
+
+
+# ==================== MAIN FUNCTION - WINDOWS VERSION ====================
+def main():
+    """
+    Main application entry point - WINDOWS VERSION.
+    
+    Key differences from original:
+    - This function is synchronous (not async)
+    - Uses application.run_polling() instead of asyncio.run(main())
+    - Uses post_init callback + create_task for job collection (no JobQueue required)
+    - No additional dependencies needed
+    """
+    logger.info("=" * 60)
+    logger.info("🚀 Job Bot Starting (v6.0 - Windows Edition)")
+    logger.info(f"📡 Channel: {Config.CHANNEL_ID}")
+    logger.info(f"⏱️ Check interval: {Config.CHECK_INTERVAL}s")
+    logger.info(f"📊 Max posts per cycle: {Config.MAX_POSTS_PER_CYCLE}")
+    logger.info(f"🤖 MarkdownV2: {Config.ENABLE_MARKDOWN_V2}")
+    logger.info(f"📱 Telegram channels: {Config.ENABLE_TELEGRAM_CHANNELS}")
+    logger.info(f"🧠 Classifier: {CLASSIFIER_AVAILABLE}")
+    logger.info(f"🎨 Formatter: {FORMATTER_AVAILABLE}")
+    logger.info(f"🎯 Smart Matching: {SMART_MATCHING_AVAILABLE}")
+    logger.info(f"💰 Salary Insights: {SALARY_ANALYZER_AVAILABLE}")
+    if Config.ADMIN_USER_ID:
+        logger.info(f"👤 Admin user ID: {Config.ADMIN_USER_ID}")
+    logger.info("=" * 60)
+
+    # ⚠️ WINDOWS FIX: Create event loop BEFORE any async operations
+    # This must be done FIRST, before any asyncio calls
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    # Initialize database using the created loop
+    db = loop.run_until_complete(init_database())
+
+    # Create Application
+    application = Application.builder().token(Config.TELEGRAM_BOT_TOKEN).build()
+    
+    # Create JobBot instance
+    job_bot = JobBot(application, db)
+    
+    # Store references in bot_data for access from callbacks
+    application.bot_data['job_bot'] = job_bot
+    application.bot_data['db'] = db
+
+    # Register command handlers
+    application.add_handler(CommandHandler("start", job_bot.cmd_start))
+    application.add_handler(CommandHandler("status", job_bot.cmd_status))
+    application.add_handler(CommandHandler("last", job_bot.cmd_last))
+    application.add_handler(CommandHandler("favorites", job_bot.cmd_favorites))
+    application.add_handler(CommandHandler("categories", job_bot.cmd_categories))
+    application.add_handler(CommandHandler("recommendations", job_bot.cmd_recommendations))
+    application.add_handler(CommandHandler("salary", job_bot.cmd_salary))
+    application.add_handler(CommandHandler("pause", job_bot.cmd_pause))
+    application.add_handler(CommandHandler("resume", job_bot.cmd_resume))
+    application.add_handler(CommandHandler("frequency", job_bot.cmd_frequency))
+    application.add_handler(CommandHandler("search", job_bot.cmd_search))
+    application.add_handler(CallbackQueryHandler(job_bot.handle_callback))
+
+    # ⚠️ WINDOWS FIX: Start background collection thread
+    start_collection_thread(job_bot, db)
+    logger.info(f"⏱️ Collection interval: {Config.CHECK_INTERVAL//60} minutes")
+
+    # Run the bot with polling
+    # The event loop is already set, so run_polling will use it
+    logger.info("🚀 Starting bot polling...")
+    application.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        main()
     except KeyboardInterrupt:
         logger.info("🛑 Bot stopped by user")
         sys.exit(0)
+    except Exception as e:
+        logger.error(f"❌ Fatal error: {e}", exc_info=True)
+        sys.exit(1)

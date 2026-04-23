@@ -91,24 +91,22 @@ class JobMessageFormatter:
     def _escape_markdown_v2(self, text: str) -> str:
         """
         Экранирование специальных символов для MarkdownV2.
-        Символы: _ * [ ] ( ) ~ ` > # + - = | { } . !
+        Символы: \ _ * [ ] ( ) ~ ` > # + - = | { } . !
         """
         if not text:
             return ''
         
-        # Экранируем все спецсимволы MarkdownV2
-        escape_chars = r'_*[]()~`>#+-=|{}.!'
-        for char in escape_chars:
-            text = text.replace(char, f'\\{char}')
-        
-        return text
+        # Экранируем все спецсимволы MarkdownV2 в один проход через regex.
+        # Обратный слэш экранируется первым, чтобы избежать двойного экранирования.
+        escape_chars = r'\_*[]()~`>#+-=|{}.!'
+        return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)
     
     def _escape_url(self, url: str) -> str:
         """Экранирование URL для MarkdownV2"""
         if not url:
             return ''
-        # В URL экранируем только ) и \
-        return url.replace(')', '%29').replace('\\', '%5C')
+        # В URL экранируем ) \ и | (зарезервирован в MarkdownV2)
+        return url.replace(')', '%29').replace('\\', '%5C').replace('|', '%7C')
     
     def _format_salary(self, salary: str) -> str:
         """Форматирование зарплаты"""
@@ -175,7 +173,7 @@ class JobMessageFormatter:
             f"{cat_emoji} *{self._escape_markdown_v2(title)}*",
             f"",
             f"🏢 _{self._escape_markdown_v2(company)}_",
-            f"{self._format_location(location)}  |  {level_emoji} {self._escape_markdown_v2(level)}",
+            f"{self._format_location(location)}  \\|  {level_emoji} {self._escape_markdown_v2(level)}",
         ]
         
         # Добавляем match_score если есть
@@ -222,7 +220,7 @@ class JobMessageFormatter:
             f"",
             f"🏢 _{self._escape_markdown_v2(company)}_",
             f"📂 Категория: {self._escape_markdown_v2(category_name)}",
-            f"{self._format_location(location)}  |  {level_emoji} {self._escape_markdown_v2(level)}",
+            f"{self._format_location(location)}  \\|  {level_emoji} {self._escape_markdown_v2(level)}",
             f"{self._format_salary(salary)}",
         ]
         
@@ -368,7 +366,7 @@ class JobMessageFormatter:
             
             lines.append(
                 f"{i}\. {cat_emoji} *{self._escape_markdown_v2(title)}*\n"
-                f"   🏢 _{self._escape_markdown_v2(company)}_  |  {level_emoji} {self._escape_markdown_v2(level)}\n"
+                f"   🏢 _{self._escape_markdown_v2(company)}_  \\|  {level_emoji} {self._escape_markdown_v2(level)}\n"
             )
         
         return '\n'.join(lines)
@@ -506,7 +504,7 @@ class JobMessageFormatter:
         
         lines = [
             f"🏢 *{self._escape_markdown_v2(company)}*",
-            f"⭐ {level_emoji} | {loc_emoji} {self._escape_markdown_v2(location)}",
+            f"⭐ {level_emoji} \\| {loc_emoji} {self._escape_markdown_v2(location)}",
             "",
             "─────────────────────",
             "",
@@ -635,7 +633,7 @@ class JobMessageFormatter:
                 f"{i}. {match_emoji} *{match_pct}%* {cat_emoji} "
                 f"{self._escape_markdown_v2(title)}"
             )
-            lines.append(f"   🏢 _{self._escape_markdown_v2(company)}_ | {level_emoji}")
+            lines.append(f"   🏢 _{self._escape_markdown_v2(company)}_ \\| {level_emoji}")
             
             if matching_techs:
                 techs_str = ', '.join(matching_techs[:3])
